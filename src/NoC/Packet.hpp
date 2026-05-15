@@ -6,6 +6,7 @@
 #ifndef PACKET_HPP_
 #define PACKET_HPP_
 
+#include <cstdint>
 #include <vector>
 #include <stdio.h>
 
@@ -24,6 +25,7 @@ struct Message{
   int chunk_start_idx;
   
   std::vector<float> data;          // Contains inputs and partial sums
+  std::vector<int32_t> cnoc_qdata;  // Quantized shadow payload for type4/type5 cNoC golden traces
   int psum_offset = 0;              // Contains the start index of psum in 'data'.
   int k_dim = 0;
 
@@ -51,6 +53,10 @@ public:
 
   float send_out_time;              // time of packet sent from PE
   float in_net_time;                // time of packet insert in to the NoC
+  int global_pid;                   // currently only used for trace
+  uint64_t cnoc_input_hash;         // payload hash captured when packet is created/reset
+  std::vector<int> trace_nodes;
+  std::vector<int> trace_times;
 
   void dest_convert(int dest, int router_num_x, int* NI_num);
   int get_next_router_dest();       // source routing helper
@@ -59,6 +65,7 @@ public:
 
   // --- Object Pool ---
   static std::vector<Packet*> free_pool;
+  static int next_global_pid;
   static Packet* allocate(Message t_message, int router_num_x, int* NI_num);
   static void release(Packet* packet);
   void reset(Message t_message, int router_num_x, int* NI_num);

@@ -16,6 +16,14 @@
 
 #define ENABLE_KV_CACHE 1         		// 1 turn on local SRAM (KV-Cache), 0 disable
 
+#ifndef CNOC_QUANT_GOLDEN
+#define CNOC_QUANT_GOLDEN 0
+#endif
+
+#define CNOC_QUANT_DATA_BYTES 1
+#define CNOC_QUANT_FRAC_BITS 4
+#define CNOC_QUANT_SCALE (1 << CNOC_QUANT_FRAC_BITS)
+
 #define INT8_QUANTIZATION 1				// 1 turn on local quantization, 0 disable
 
 #if INT8_QUANTIZATION
@@ -47,7 +55,7 @@
 #define NI_TX_FIFO_DEPTH (32 * QUANT_MULTIPLIER)
 #define NI_RX_FIFO_DEPTH (32 * QUANT_MULTIPLIER)
 
-#define MemNode32  						// 32 MC cores (for 16*16 NoC)
+#define MemNode8  						// 8 MC cores (for 8*8 NoC)
 
 /******************************/
 // Here we define evaluation modes. DNN model file is always required. In FE mode, weight and input files are required.
@@ -178,6 +186,8 @@ struct GlobalParams {
 	static char NNmodel_filename[128];
 	static char NNweight_filename[128];
 	static char NNinput_filename[128];
+	static bool enable_trace;
+	static bool enable_rtl_router;
 };
 
 

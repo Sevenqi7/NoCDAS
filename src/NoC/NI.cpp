@@ -5,6 +5,7 @@
 
 #include "NI.hpp"
 #include "../parameters.hpp"
+#include "../TraceLogger.hpp"
 
 int NI::count_s=0;
 int NI::count_r=0;
@@ -728,11 +729,15 @@ void NI::inputCheck(){
                   count_r++;
                   //cout << "NI received " << count_r << endl;
               }
-              else{ // response type 1
+              else{ // response/cNoC packets
                   count_r_resp++;
                   //cout <<  "NI received response " << count_r_resp << endl;
                   packet_buffer_out[1].push_back(packet);
               }
+
+              packet->trace_nodes = flit->trace_node;
+              packet->trace_times = flit->trace_time;
+              TraceLogger::instance().logPacket(*packet);
 
 
               if(packet->message.QoS == 3 || packet->message.QoS == 1){
@@ -811,4 +816,3 @@ NI::~NI (){
   delete in_port;
   delete out_port;
 }
-

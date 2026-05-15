@@ -20,6 +20,7 @@
 #include "NoC/VCNetwork.hpp"
 #include "MACnet.hpp"
 #include "Model.hpp"
+#include "TraceLogger.hpp"
 
 using namespace std;
 
@@ -42,6 +43,8 @@ int PE_NUM = PE_X_NUM * PE_Y_NUM;
 char GlobalParams::NNmodel_filename[128] = DEFAULT_NNMODEL_FILENAME;
 char GlobalParams::NNweight_filename[128] = DEFAULT_NNWEIGHT_FILENAME;
 char GlobalParams::NNinput_filename[128] = DEFAULT_NNINPUT_FILENAME;
+bool GlobalParams::enable_trace = false;
+bool GlobalParams::enable_rtl_router = false;
 
 void parseCmdLine(int arg_num, char *arg_vet[])
 {
@@ -55,6 +58,10 @@ void parseCmdLine(int arg_num, char *arg_vet[])
 				strcpy(GlobalParams::NNweight_filename, arg_vet[++i]);
 			else if (!strcmp(arg_vet[i], "-NNinput"))
 				strcpy(GlobalParams::NNinput_filename, arg_vet[++i]);
+			else if (!strcmp(arg_vet[i], "-trace"))
+				GlobalParams::enable_trace = true;
+			else if (!strcmp(arg_vet[i], "-rtl_router"))
+				GlobalParams::enable_rtl_router = true;
 			else {
 				cerr << "Error: Invalid option: " << arg_vet[i] << endl;
 				exit(1);
@@ -68,6 +75,13 @@ int main(int arg_num, char *arg_vet[]) {
 
 	cout << "Initialize" << endl;
 	parseCmdLine(arg_num, arg_vet);
+
+	if (GlobalParams::enable_trace) {
+		TraceLogger::instance().enable("trace.log");
+	}
+	if (GlobalParams::enable_rtl_router) {
+		cout << "Verilated RTL Router backend enabled (RTL-owned cNoC path)" << endl;
+	}
 
 	chrono::steady_clock::time_point begin = chrono::steady_clock::now();
 
@@ -247,6 +261,7 @@ int main(int arg_num, char *arg_vet[]) {
 	cout << "Execution time (sec) = " <<  (chrono::duration_cast<chrono::microseconds>(end - begin).count()) /1000000.0  << endl;
 
 	cout << "!!END!!" << endl;
+	TraceLogger::instance().close();
 	delete macnet;
 	delete cnnmodel;
 	return 0;

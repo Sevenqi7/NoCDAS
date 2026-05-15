@@ -122,6 +122,13 @@ public:
 	// It generates the distribution packets (type 4) and computation packets (type 5)
     void inject_cNoC_traffic(); 
 
+    // Phase-2 computation packets must not overtake phase-1 distribution packets.
+    int expected_cnoc_distribution_payload(int router_id) const;
+    bool cnoc_distribution_ready() const;
+    std::vector<unsigned int> cnoc_rtl_weight_baseline;
+    std::vector<unsigned int> cnoc_rtl_kv_baseline;
+    std::vector<unsigned int> cnoc_rtl_token_baseline;
+
 	~MACnet ();
 };
 

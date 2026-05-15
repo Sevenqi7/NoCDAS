@@ -12,12 +12,14 @@
 #include "VCNetwork.hpp"
 #include "NRBase.hpp"
 #include "Model.hpp"
+#include <cstdint>
 #include <vector>
 #include <map>
 
 class RInPort;
 class ROutPort;
 class VCNetwork;
+class VerilatedRouter;
 
 extern unsigned int cycles;
 
@@ -30,6 +32,7 @@ public:
       double running_max;
       double running_sum;
       bool is_active;
+      std::vector<int32_t> matmul_accum_q;
 
       ComputeVCState() : compute_op(-1), running_max(-1e9), running_sum(0.0), is_active(false) {}
       
@@ -38,6 +41,7 @@ public:
           running_max = -1e9;
           running_sum = 0.0;
           is_active = false;
+          matmul_accum_q.clear();
       }
   };
 
@@ -60,6 +64,8 @@ public:
   // Local SRAM (replaces simple W registers to support Transformer operations)
   std::vector<float> local_weights;           // Weights distributed to this router (e.g., Q, K, V projections)
   std::vector<float> local_kv_cache;
+  std::vector<int32_t> local_weights_q8;
+  std::vector<int32_t> local_kv_cache_q8;
 
   // Indexes: [port_idx][vc_idx]
   std::vector<std::vector<ComputeVCState>> vc_compute_state;
@@ -73,6 +79,8 @@ public:
   void storeKV(float kv_value);
   void writeKV(int index, float kv_value);
   void storeWeight(float weight_value);
+  void storeWeightQuant(int32_t weight_q);
+  void writeKVQuant(int index, int32_t kv_q);
 
 //   std::vector<unsigned int> mfu_occupied_until;
   unsigned int mfu_occupied_until;
@@ -83,6 +91,8 @@ public:
   // Multi-way Function Unit (MFU) functions
   void computeInTransit(Flit* t_flit, int port_idx);
   void processDistributionPacket(Flit* t_flit);
+  void computeInTransitQuant(Flit* t_flit, int port_idx);
+  void processDistributionPacketQuant(Flit* t_flit);
 
   // Main components
   std::vector<RInPort*> in_port_list;
@@ -99,6 +109,8 @@ public:
   int port_utilization_innet;
 
   int rr_out_port;
+
+  VerilatedRouter* rtl_router;
 
   ~VCRouter ();
 };

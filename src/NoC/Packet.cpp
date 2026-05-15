@@ -4,32 +4,89 @@
  */
 
 #include "Packet.hpp"
+#include "../CNoCQuant.hpp"
 #include "../parameters.hpp"
+#include <cstdint>
+#include <cstring>
 #include <iostream>
 //type convert: add change type and vnet
 
 std::vector<Packet*> Packet::free_pool;
+int Packet::next_global_pid = 0;
+
+namespace {
+
+uint64_t mixHash64(uint64_t hash, uint64_t value) {
+  hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+  return hash;
+}
+
+uint64_t hashFloatVector(const std::vector<float>& data) {
+  uint64_t hash = 1469598103934665603ULL;
+  hash = mixHash64(hash, static_cast<uint64_t>(data.size()));
+  for (size_t i = 0; i < data.size(); ++i) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &data[i], sizeof(bits));
+    uint64_t payload = (static_cast<uint64_t>(i) << 32) | static_cast<uint64_t>(bits);
+    hash = mixHash64(hash, payload);
+  }
+  return hash;
+}
+
+int payloadBytesForMessageType(int message_type) {
+#if CNOC_QUANT_GOLDEN
+  if (message_type == 4 || message_type == 5) {
+    return CNOC_QUANT_DATA_BYTES;
+  }
+#endif
+  return DATA_BYTES;
+}
+
+void prepareCnocQuantPayload(Message& message) {
+#if CNOC_QUANT_GOLDEN
+  if (message.type == 4 || message.type == 5) {
+    CNoCQuant::quantizeVector(message.data, message.cnoc_qdata);
+  } else {
+    message.cnoc_qdata.clear();
+  }
+#else
+  (void)message;
+#endif
+}
+
+uint64_t hashInitialPayload(const Message& message) {
+#if CNOC_QUANT_GOLDEN
+  if (message.type == 4 || message.type == 5) {
+    return CNoCQuant::hashIntVector(message.cnoc_qdata);
+  }
+#endif
+  return hashFloatVector(message.data);
+}
+
+}  // namespace
 
 Packet::Packet(Message t_message, int router_num_x, int* NI_num) 
     : message(std::move(t_message))
 {
   int t_type = message.type; 
   int data_length = message.data_length;
+  int payload_bytes = payloadBytesForMessageType(t_type);
+  prepareCnocQuantPayload(message);
   
   current_path_index = 0;
 
   dest_convert(message.destination, router_num_x, NI_num);
   
   switch (t_type){
-    case 0: length = data_length * DATA_BYTES + 2;
+    case 0: length = data_length * payload_bytes + 2;
             type = 0;
             vnet = 0;
             break;
-    case 1: length = data_length * DATA_BYTES + 2;
+    case 1: length = data_length * payload_bytes + 2;
             type = 0;	
             vnet = 0;
             break;
-    case 2: length = data_length * DATA_BYTES + 2;
+    case 2: length = data_length * payload_bytes + 2;
             type = 1;
             vnet = 0;
             break;
@@ -38,14 +95,14 @@ Packet::Packet(Message t_message, int router_num_x, int* NI_num)
             vnet = 0;
             break;
     case 4: // PACKET_DISTRIBUTION
-            length = data_length * DATA_BYTES + 2; // weights are float (4 byte)
+            length = data_length * payload_bytes + 2;
             type = 0;
             vnet = 1;
             break;
     case 5: // PACKET_COMPUTATION
             // The length includes both the input data (es. input_vector) and the space for the psum
             // Length depends on the unified buffer 'data' only.
-            length = message.data.size() * DATA_BYTES + 4; // +4 bytes overhead per opcode
+            length = message.data.size() * payload_bytes + 4; // +4 bytes overhead per opcode
             type = 0; // Like request but with higher priority
             vnet = 1;
             break;
@@ -62,6 +119,10 @@ Packet::Packet(Message t_message, int router_num_x, int* NI_num)
 
   send_out_time = 0;
   in_net_time = 0;
+  global_pid = next_global_pid++;
+  cnoc_input_hash = hashInitialPayload(message);
+  trace_nodes.clear();
+  trace_times.clear();
 }
 
 // Source Routing helper
@@ -105,27 +166,31 @@ void Packet::release(Packet* packet) {
 
 void Packet::reset(Message t_message, int router_num_x, int* NI_num) {
     message = std::move(t_message);
+    prepareCnocQuantPayload(message);
     current_path_index = 0;
     dest_convert(message.destination, router_num_x, NI_num);
     
     send_out_time = 0;
     in_net_time = 0;
+    global_pid = next_global_pid++;
+    cnoc_input_hash = hashInitialPayload(message);
+    trace_nodes.clear();
+    trace_times.clear();
     
     int t_type = message.type; 
     int data_length = message.data_length;
+    int payload_bytes = payloadBytesForMessageType(t_type);
     
     switch (t_type){
-        case 0: length = data_length * DATA_BYTES + 2; type = 0; vnet = 0; break;
-        case 1: length = data_length * DATA_BYTES + 2; type = 0; vnet = 0; break;
-        case 2: length = data_length * DATA_BYTES + 2; type = 1; vnet = 0; break;
+        case 0: length = data_length * payload_bytes + 2; type = 0; vnet = 0; break;
+        case 1: length = data_length * payload_bytes + 2; type = 0; vnet = 0; break;
+        case 2: length = data_length * payload_bytes + 2; type = 1; vnet = 0; break;
         case 3: length = 1 + 2; type = 1; vnet = 0; break;
-        case 4: length = data_length * DATA_BYTES + 2; type = 0; vnet = 1; break;
-        case 5: length = message.data.size() * DATA_BYTES + 4; type = 0; vnet = 1; break;
+        case 4: length = data_length * payload_bytes + 2; type = 0; vnet = 1; break;
+        case 5: length = message.data.size() * payload_bytes + 4; type = 0; vnet = 1; break;
     }
 
     if (length % FLIT_LENGTH != 0) {
         length = ((length + FLIT_LENGTH - 1) / FLIT_LENGTH) * FLIT_LENGTH;
     }
 }
-
-

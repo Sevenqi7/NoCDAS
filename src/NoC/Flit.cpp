@@ -9,6 +9,19 @@
 const int Flit::length = FLIT_LENGTH;
 std::vector<Flit*> Flit::free_pool;
 
+namespace {
+
+int payloadBytesForFlitPacket(const Packet* packet) {
+#if CNOC_QUANT_GOLDEN
+    if (packet != nullptr && (packet->message.type == 4 || packet->message.type == 5)) {
+        return CNOC_QUANT_DATA_BYTES;
+    }
+#endif
+    return DATA_BYTES;
+}
+
+}
+
 Flit::Flit(int t_id, int t_type, int t_vnet, int t_vc, Packet* t_packet, float t_cycles, int t_pid){
     id = t_id;
     type = t_type;
@@ -23,10 +36,14 @@ Flit::Flit(int t_id, int t_type, int t_vnet, int t_vc, Packet* t_packet, float t
     trace_time.reserve(X_NUM + Y_NUM);
 
     current_payload_size = 0;
+    rtl_route_initialized = false;
+    rtl_route_ptr = 0;
+    rtl_route_ports.clear();
+    rtl_route_process.clear();
 
     if (packet != nullptr && (packet->message.type == 4 || packet->message.type == 5)) {
         // int floats_per_flit = FLIT_LENGTH / 4; 
-        int elements_per_flit = FLIT_LENGTH / DATA_BYTES;
+        int elements_per_flit = FLIT_LENGTH / payloadBytesForFlitPacket(packet);
         int op = packet->message.compute_op;
         
         global_data_offset = id * elements_per_flit;
@@ -86,9 +103,13 @@ void Flit::reset(int t_id, int t_type, int t_vnet, int t_vc, Packet* t_packet, f
 
     current_payload_size = 0;
     global_data_offset = 0;
+    rtl_route_initialized = false;
+    rtl_route_ptr = 0;
+    rtl_route_ports.clear();
+    rtl_route_process.clear();
 
     if (packet != nullptr && (packet->message.type == 4 || packet->message.type == 5)) {
-        int elements_per_flit = FLIT_LENGTH / DATA_BYTES;
+        int elements_per_flit = FLIT_LENGTH / payloadBytesForFlitPacket(packet);
         global_data_offset = id * elements_per_flit;
 
         if (global_data_offset >= 0) {

@@ -7,6 +7,7 @@
 #define VC_FLIT_HPP_
 
 #include "Packet.hpp"
+#include <cstdint>
 #include <vector>
 #include <bitset>
 #include "../parameters.hpp"
@@ -47,6 +48,14 @@ public:
   int global_data_offset;
 
   int current_payload_size;
+
+  // Co-simulation source-route state for cNoC packets. The RTL router consumes
+  // this per-flit route sequence and per-hop process mask instead of relying on
+  // C++ getRoute()/computed_routers at each hop.
+  bool rtl_route_initialized;
+  int rtl_route_ptr;
+  std::vector<uint8_t> rtl_route_ports;
+  std::vector<uint8_t> rtl_route_process;
   
   float get_data(int local_index) const;
   int get_payload_size() const;

@@ -4,6 +4,9 @@
  */
 
 #include "MACnet.hpp"
+#include "CNoCQuant.hpp"
+#include "parameters.hpp"
+#include "rtl/VerilatedRouter.hpp"
 #include <algorithm>
 
 template<class C, typename T>
@@ -24,46 +27,49 @@ MACnet::MACnet (int mac_num, int t_pe_x, int t_pe_y, Model *m, VCNetwork* t_Netw
     o_fn = 0;
     int temp_ni_id;
     cout << "Layer in total " << n_layer << endl;
-    
-    causal_mask_flag = 0;
-    cnoc_phase = 0; 
 
-    for(int i=0; i<macNum; i++){ 
+    causal_mask_flag = 0;
+    cnoc_phase = 0;
+    cnoc_rtl_weight_baseline.assign(TOT_NUM, 0);
+    cnoc_rtl_kv_baseline.assign(TOT_NUM, 0);
+    cnoc_rtl_token_baseline.assign(TOT_NUM, 0);
+
+    for(int i=0; i<macNum; i++){
         temp_ni_id = i%TOT_NUM;
-        MAC* nMAC = new MAC(i, this, temp_ni_id); 
+        MAC* nMAC = new MAC(i, this, temp_ni_id);
         MAC_list.push_back(nMAC);
     }
 
     deque<int> layer_info;
-    if(cnnmodel->all_layer_type[c_layer]!='i') 
+    if(cnnmodel->all_layer_type[c_layer]!='i')
     {
         cout << "err: first layer is not input" << endl;
     }
     layer_info = cnnmodel->all_layer_size[c_layer];
-    in_x = layer_info[1]; 
-    in_y = layer_info[2]; 
-    in_ch = layer_info[3]; 
+    in_x = layer_info[1];
+    in_y = layer_info[2];
+    in_ch = layer_info[3];
     c_layer++;
 
-    no_x = 0; no_y = 0; nw_x = 0; nw_y = 0; no_ch = 0; npad = 0; nstride = 1; 
+    no_x = 0; no_y = 0; nw_x = 0; nw_y = 0; no_ch = 0; npad = 0; nstride = 1;
 
     layer_info = cnnmodel->all_layer_size[c_layer];
     if(cnnmodel->all_layer_type[c_layer]=='c')
     {
-        w_x = layer_info[1]; w_y = layer_info[2]; o_ch = layer_info[3]; 
-        w_ch = o_ch * in_ch; o_fn = layer_info[5]; pad = layer_info[6]; stride = layer_info[7]; 
+        w_x = layer_info[1]; w_y = layer_info[2]; o_ch = layer_info[3];
+        w_ch = o_ch * in_ch; o_fn = layer_info[5]; pad = layer_info[6]; stride = layer_info[7];
         assert((in_ch == layer_info[4]) && "Input channel not correct!");
         o_x = (in_x + 2*pad - w_x) / stride + 1;
         o_y = (in_y + 2*pad - w_y) / stride + 1;
     }
-    else if(cnnmodel->all_layer_type[c_layer]=='e') 
+    else if(cnnmodel->all_layer_type[c_layer]=='e')
     {
-        w_x = layer_info[1]; w_y = 1; o_ch = 1; w_ch = layer_info[0]; 
-        o_fn = 19; pad = 0; stride = 1; o_x = w_x; o_y = in_x; 
+        w_x = layer_info[1]; w_y = 1; o_ch = 1; w_ch = layer_info[0];
+        o_fn = 19; pad = 0; stride = 1; o_x = w_x; o_y = in_x;
     }
 
     st_w = 0;
-    readyflag = 0; 
+    readyflag = 0;
     cout << "!!MACnet created!!" << endl;
     cout << "layer" << c_layer << " created " << cnnmodel->all_layer_type[c_layer] << ' ' << in_ch << ' ' << (o_ch * o_x * o_y) << endl;
 
@@ -73,14 +79,14 @@ MACnet::MACnet (int mac_num, int t_pe_x, int t_pe_y, Model *m, VCNetwork* t_Netw
 bool serpentine_sort(int id_a, int id_b) {
     int y_a = id_a / X_NUM;
     int x_a = id_a % X_NUM;
-    
+
     int y_b = id_b / X_NUM;
     int x_b = id_b % X_NUM;
 
     // If they are on different rows, sort from top to bottom
     if (y_a != y_b) {
-        return y_a < y_b; 
-    } 
+        return y_a < y_b;
+    }
     // If they are on the same row, it depends on whether the row is even or odd
     else {
         if (y_a % 2 == 0) {
@@ -99,7 +105,7 @@ void MACnet::create_input(){
     int padded_y = in_y + 2*pad;
     weight_table.resize(w_ch);
 
-    if (this->c_layer == 1) 
+    if (this->c_layer == 1)
     {
         for(int i=0;i<in_ch;i++){
             if(pad==0) {
@@ -112,7 +118,7 @@ void MACnet::create_input(){
                     }
                 }
             }
-        }       
+        }
     }
     else if (this->c_layer >=2)
     {
@@ -136,8 +142,8 @@ void MACnet::create_input(){
     {
         for(int i=0;i<o_ch;i++){
             for(int j=0;j<in_ch;j++) {
-                weight_table[i*in_ch + j].assign(this->cnnmodel->all_weight_in[st_w + i].begin() + j*wmatsize,this->cnnmodel->all_weight_in[st_w + i].begin() + j*wmatsize + wmatsize); 
-                weight_table[i*in_ch + j].push_back(this->cnnmodel->all_weight_in[st_w + i].back()); 
+                weight_table[i*in_ch + j].assign(this->cnnmodel->all_weight_in[st_w + i].begin() + j*wmatsize,this->cnnmodel->all_weight_in[st_w + i].begin() + j*wmatsize + wmatsize);
+                weight_table[i*in_ch + j].push_back(this->cnnmodel->all_weight_in[st_w + i].back());
             }
         }
         st_w += o_ch;
@@ -166,9 +172,9 @@ void MACnet::create_input(){
     {
         nw_x = cnnmodel->all_layer_size[c_layer+1][1];
         nw_y = cnnmodel->all_layer_size[c_layer+1][2];
-        no_ch = cnnmodel->all_layer_size[c_layer+1][3]; 
-        npad = cnnmodel->all_layer_size[c_layer+1][4]; 
-        nstride = cnnmodel->all_layer_size[c_layer+1][5]; 
+        no_ch = cnnmodel->all_layer_size[c_layer+1][3];
+        npad = cnnmodel->all_layer_size[c_layer+1][4];
+        nstride = cnnmodel->all_layer_size[c_layer+1][5];
         assert((o_ch == no_ch) && "Input channel not correct for merged pooling!");
         no_x = (o_x + 2*npad - nw_x) / nstride + 1;
         no_y = (o_y + 2*npad - nw_y) / nstride + 1;
@@ -200,7 +206,7 @@ void MACnet::mapping(int neuronnum){
             mac_iter = (mac_iter + 1) % macNum;
         }
         this->mapping_table[mac_iter].push_back(j);
-        j++; 
+        j++;
         if (this->cnnmodel->all_layer_type[c_layer] == 't') {
             if (j % head_dim == 0) mac_iter = (mac_iter + 1) % macNum;
         } else {
@@ -237,7 +243,7 @@ void MACnet::ymapping(int neuronnum){
             continue;
         }
         this->mapping_table[k].push_back(j);
-        j++; 
+        j++;
         if (this->cnnmodel->all_layer_type[c_layer] == 't') {
             if (j % head_dim == 0) mac_iter = (mac_iter + 1) % macNum;
         } else {
@@ -255,7 +261,7 @@ void MACnet::rmapping(int neuronnum){
         int n_heads = this->cnnmodel->all_layer_size[c_layer][3];
         head_dim = q_dim / n_heads;
     }
-    unsigned seed = 0; 
+    unsigned seed = 0;
     vector<int> npos;
     for (int c=0; c<macNum; c++) {npos.push_back(c);}
     shuffle(npos.begin(), npos.end(), default_random_engine(seed));
@@ -272,7 +278,7 @@ void MACnet::rmapping(int neuronnum){
             continue;
         }
         this->mapping_table[k].push_back(j);
-        j++; 
+        j++;
         if (this->cnnmodel->all_layer_type[c_layer] == 't') {
             if (j % head_dim == 0) mac_iter = (mac_iter + 1) % macNum;
         } else {
@@ -285,21 +291,21 @@ void MACnet::rmapping(int neuronnum){
 //     cnoc_compute_path.clear();
 //     this->mapping_table.clear();
 //     this->mapping_table.resize(macNum);
-    
+
 //     std::vector<int> avail_routers;
 //     // Vector to track how much SRAM (in number of floats) is occupied in each router
-//     std::vector<int> router_sram_usage(TOT_NUM, 0); 
+//     std::vector<int> router_sram_usage(TOT_NUM, 0);
 
 //     for (int i = 0; i < TOT_NUM; i++) {
 //         // this->vcNetwork->router_list[i]->local_weights.clear();
 //         this->vcNetwork->router_list[i]->clearSRAM();
 
-//         this->vcNetwork->router_list[i]->assigned_tasks.clear(); 
+//         this->vcNetwork->router_list[i]->assigned_tasks.clear();
 //         if (!contains(dest_list, i)) {
 //             avail_routers.push_back(i);
 //         }
 //     }
-    
+
 //     for (int t = 0; t < task_num; t++) {
 //         // Determine the weight memory footprint of the current task
 //         int w_idx = t % (this->weight_table.empty() ? 1 : this->weight_table.size());
@@ -317,12 +323,12 @@ void MACnet::rmapping(int neuronnum){
 //                 // Sufficient space: assign the task to the router
 //                 this->vcNetwork->router_list[r_id]->assigned_tasks.push_back(t);
 //                 router_sram_usage[r_id] += required_sram;
-                
+
 //                 // If it's not already in the compute path, add it
 //                 if (std::find(cnoc_compute_path.begin(), cnoc_compute_path.end(), r_id) == cnoc_compute_path.end()) {
 //                     cnoc_compute_path.push_back(r_id);
 //                 }
-                
+
 //                 task_assigned = true;
 //                 break; // Exit the router search loop, move to the next task
 //             }
@@ -338,34 +344,47 @@ void MACnet::rmapping(int neuronnum){
 //             cout << " 1. Increase ROUTER_SRAM_LIMIT in parameters.hpp" << endl;
 //             cout << " 2. Increase the NoC dimensions (e.g., MemNode18, MemNode32)" << endl;
 //             cout << "------------------------------------------------------------------\n" << endl;
-//             exit(1); 
+//             exit(1);
 //         }
 //     }
 
 //     // Topological sort based on the physical layout of the NoC to minimize routing conflicts and potential deadlocks
 //     std::sort(cnoc_compute_path.begin(), cnoc_compute_path.end(), serpentine_sort);
-    
-//     cnoc_phase = 1; 
+
+//     cnoc_phase = 1;
 // }
 
 void MACnet::cNoC_mapping(int task_num) {
     cnoc_compute_path.clear();
     this->mapping_table.clear();
     this->mapping_table.resize(macNum);
-    
+
     std::vector<int> avail_routers;
-    std::vector<int> router_sram_usage(TOT_NUM, 0); 
+    std::vector<int> router_sram_usage(TOT_NUM, 0);
 
     for (int i = 0; i < TOT_NUM; i++) {
         this->vcNetwork->router_list[i]->clearSRAM();
-        this->vcNetwork->router_list[i]->assigned_tasks.clear(); 
+        if (this->vcNetwork->router_list[i]->rtl_router != nullptr) {
+            cnoc_rtl_weight_baseline[i] =
+                this->vcNetwork->router_list[i]->rtl_router->cnocWeightBytesStored();
+            cnoc_rtl_kv_baseline[i] =
+                this->vcNetwork->router_list[i]->rtl_router->cnocKvBytesStored();
+            cnoc_rtl_token_baseline[i] =
+                this->vcNetwork->router_list[i]->rtl_router->cnocKvTokenCount();
+        } else {
+            cnoc_rtl_weight_baseline[i] = 0;
+            cnoc_rtl_kv_baseline[i] = 0;
+            cnoc_rtl_token_baseline[i] = 0;
+        }
+
+        this->vcNetwork->router_list[i]->assigned_tasks.clear();
         if (!contains(dest_list, i)) {
             avail_routers.push_back(i);
         }
     }
-    
+
     this->chunk_start_task_idx = this->last_mapped_task_idx;
-    
+
     bool sram_full_globally = false;
 
     for (int t = this->last_mapped_task_idx; t < task_num; t++) {
@@ -381,11 +400,11 @@ void MACnet::cNoC_mapping(int task_num) {
             if (router_sram_usage[r_id] + required_sram <= ROUTER_SRAM_LIMIT) {
                 this->vcNetwork->router_list[r_id]->assigned_tasks.push_back(t);
                 router_sram_usage[r_id] += required_sram;
-                
+
                 if (std::find(cnoc_compute_path.begin(), cnoc_compute_path.end(), r_id) == cnoc_compute_path.end()) {
                     cnoc_compute_path.push_back(r_id);
                 }
-                
+
                 task_assigned = true;
                 break;
             }
@@ -405,63 +424,153 @@ void MACnet::cNoC_mapping(int task_num) {
     this->tasks_in_current_chunk = this->last_mapped_task_idx - this->chunk_start_task_idx;
 
     std::sort(cnoc_compute_path.begin(), cnoc_compute_path.end(), serpentine_sort);
-    
+
     this->current_chunk_idx++;
-    this->cnoc_phase = 1; 
+    this->cnoc_phase = 1;
+}
+
+int MACnet::expected_cnoc_distribution_payload(int router_id) const {
+    if (router_id < 0 || router_id >= static_cast<int>(this->vcNetwork->router_list.size())) {
+        return 0;
+    }
+
+    VCRouter* router = this->vcNetwork->router_list[router_id];
+    if (router == nullptr) {
+        return 0;
+    }
+
+    if (o_fn == ATTENTION) {
+        if (cnoc_compute_path.empty()) {
+            return 0;
+        }
+        int tokens_for_router = 0;
+        for (int y = 0; y < this->in_y; y++) {
+            if (cnoc_compute_path[y % cnoc_compute_path.size()] == router_id) {
+                tokens_for_router++;
+            }
+        }
+        if (tokens_for_router == 0) {
+            return 0;
+        }
+        const int fused_dim = this->cnnmodel->all_layer_size[c_layer][0];
+        const int q_dim = this->cnnmodel->all_layer_size[c_layer][1];
+        return tokens_for_router * std::max(0, fused_dim - q_dim);
+    }
+
+    if (this->weight_table.empty()) {
+        return router->assigned_tasks.empty() ? 0 : 1;
+    }
+
+    int expected = 0;
+    for (int task_idx : router->assigned_tasks) {
+        int w_idx = task_idx % static_cast<int>(this->weight_table.size());
+        expected += static_cast<int>(this->weight_table[w_idx].size());
+    }
+    return expected;
+}
+
+// System-level phase gate: wait until type4 distribution packets have actually
+// populated router-local SRAM/KV state before injecting dependent type5 compute.
+bool MACnet::cnoc_distribution_ready() const {
+    for (int router_id : cnoc_compute_path) {
+        VCRouter* router = this->vcNetwork->router_list[router_id];
+        if (router == nullptr) {
+            return false;
+        }
+
+        const int expected_payload = expected_cnoc_distribution_payload(router_id);
+        if (expected_payload <= 0) {
+            continue;
+        }
+
+        if (router->rtl_router != nullptr) {
+            const unsigned int expected = static_cast<unsigned int>(expected_payload);
+            if (o_fn == ATTENTION) {
+                const unsigned int kv_delta =
+                    router->rtl_router->cnocKvBytesStored() - cnoc_rtl_kv_baseline[router_id];
+                const unsigned int token_delta =
+                    router->rtl_router->cnocKvTokenCount() - cnoc_rtl_token_baseline[router_id];
+                if (kv_delta < expected || token_delta == 0) {
+                    return false;
+                }
+            } else {
+                const unsigned int weight_delta =
+                    router->rtl_router->cnocWeightBytesStored() - cnoc_rtl_weight_baseline[router_id];
+                if (weight_delta < expected) {
+                    return false;
+                }
+            }
+        } else if (o_fn == ATTENTION) {
+            if (static_cast<int>(router->local_kv_cache.size()) < expected_payload ||
+                router->kv_token_count <= 0) {
+                return false;
+            }
+        } else if (static_cast<int>(router->local_weights.size()) < expected_payload) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void MACnet::inject_cNoC_traffic() {
-    int mem_id = dest_list[0]; 
+    int mem_id = dest_list[0];
     NI* mem_ni = this->vcNetwork->NI_list[mem_id];
 
     if (cnoc_phase == 1) {
+        int dist_packets = 0;
         if (o_fn == ATTENTION) {
             int fused_dim = this->cnnmodel->all_layer_size[c_layer][0];
             int q_dim = this->cnnmodel->all_layer_size[c_layer][1];
             int k_dim = this->cnnmodel->all_layer_size[c_layer][2];
 
             for (int y = 0; y < this->in_y; y++) {
-                Message dist_msg = Message(); 
+                Message dist_msg = Message();
                 dist_msg.source_id = mem_id;
                 dist_msg.NI_id = mem_id;
                 dist_msg.mac_id = mem_id;
-                
+
                 int target_router = cnoc_compute_path[y % cnoc_compute_path.size()];
-                dist_msg.destination = target_router; 
-                
-                dist_msg.type = 4; 
+                dist_msg.destination = target_router;
+
+                dist_msg.type = 4;
                 dist_msg.compute_op = o_fn;
-                dist_msg.out_cycle = cycles; 
+                dist_msg.out_cycle = cycles;
                 dist_msg.signal_id = packet_id + y;
+                // Attention type4 packets load one token's [K, V] vector into
+                // router-local KV cache.  RTL uses k_dim from the header to
+                // derive the per-token stride (K bytes followed by V bytes),
+                // while the C++ model historically inferred the same value from
+                // data_length.  Carry it explicitly so both models share the
+                // same storage layout contract.
+                dist_msg.k_dim = k_dim;
 
                 int base_idx = y * fused_dim;
-                
+
                 dist_msg.data.insert(dist_msg.data.end(), this->input_table[0].begin() + base_idx + q_dim, this->input_table[0].begin() + base_idx + q_dim + k_dim);
-                                     
+
                 dist_msg.data.insert(dist_msg.data.end(), this->input_table[0].begin() + base_idx + q_dim + k_dim, this->input_table[0].begin() + base_idx + fused_dim);
-                
+
                 dist_msg.data_length = dist_msg.data.size();
-                
+
                 Packet* p = Packet::allocate(std::move(dist_msg), X_NUM, mem_ni->NI_num);
 
                 int memory_latency = std::ceil(dist_msg.data_length * MEM_read_delay) + CACHE_DELAY;
-                p->send_out_time = cycles + memory_latency; 
-                
+                p->send_out_time = cycles + memory_latency;
+
                 p->in_net_time = cycles;
                 mem_ni->packetBuffer_list[p->vnet]->enqueue(p);
+                dist_packets++;
             }
         } else {
-            int w_idx_path = 0;
-
             for (int router_id : cnoc_compute_path) {
-                Message dist_msg = Message(); 
+                Message dist_msg = Message();
                 dist_msg.source_id = mem_id;
                 dist_msg.NI_id = mem_id;
                 dist_msg.mac_id = mem_id;
-                dist_msg.destination = router_id; 
-                dist_msg.type = 4; 
+                dist_msg.destination = router_id;
+                dist_msg.type = 4;
                 dist_msg.compute_op = o_fn;
-                dist_msg.out_cycle = cycles; 
+                dist_msg.out_cycle = cycles;
                 dist_msg.signal_id = packet_id;
 
                 auto router = this->vcNetwork->router_list[router_id];
@@ -471,53 +580,64 @@ void MACnet::inject_cNoC_traffic() {
                         dist_msg.data.insert(dist_msg.data.end(), this->weight_table[w_idx].begin(), this->weight_table[w_idx].end());
                     }
                 } else {
-                    dist_msg.data.push_back(1.0f); 
+                    dist_msg.data.push_back(1.0f);
                 }
-                
+
                 dist_msg.data_length = dist_msg.data.size();
-                
+
                 Packet* p = Packet::allocate(std::move(dist_msg), X_NUM, mem_ni->NI_num);
 
                 int memory_latency = std::ceil(dist_msg.data_length * MEM_read_delay) + CACHE_DELAY;
-                p->send_out_time = cycles + memory_latency; 
-                
+                p->send_out_time = cycles + memory_latency;
+
                 p->in_net_time = cycles;
                 mem_ni->packetBuffer_list[p->vnet]->enqueue(p);
 
-                w_idx_path++;
+                dist_packets++;
             }
         }
-        cnoc_phase = 2; 
+        cout << "[cNoC][phase1->2] cycle=" << cycles
+             << " layer=" << c_layer
+             << " dist_packets=" << dist_packets
+             << " compute_path_len=" << cnoc_compute_path.size()
+             << endl;
+        cnoc_phase = 2;
     }
     else if (cnoc_phase == 2) {
+        if (!cnoc_distribution_ready()) {
+            return;
+        }
+
+		// Send a packet cNoC for EACH token in the sequence (in_y)
+        int injected_comp = 0;
         for (int y = 0; y < this->in_y; y++) {
             Message comp_msg = Message();
             comp_msg.source_id = mem_id;
             comp_msg.NI_id = mem_id;
             comp_msg.mac_id = mem_id;
-            comp_msg.destination = mem_id; 
-            comp_msg.type = 5; 
+            comp_msg.destination = mem_id;
+            comp_msg.type = 5;
             comp_msg.compute_op = o_fn;
-            comp_msg.out_cycle = cycles; 
+            comp_msg.out_cycle = cycles;
             comp_msg.signal_id = packet_id + y;
-            
-            comp_msg.sequence_id = y; 
-            
+
+            comp_msg.sequence_id = y;
+
             comp_msg.chunk_start_idx = this->chunk_start_task_idx;
-            
+
             comp_msg.routing_path.assign(cnoc_compute_path.begin(), cnoc_compute_path.end());
             comp_msg.routing_path.push_back(mem_id);
-            
+
             int token_start = y * this->in_x;
             int token_end   = (y + 1) * this->in_x;
-            
-            comp_msg.data.reserve(this->in_x * 2 + this->tasks_in_current_chunk); 
-            if (o_fn == 18 || o_fn == 21|| o_fn == 24) { 
+
+            comp_msg.data.reserve(this->in_x * 2 + this->tasks_in_current_chunk);
+            if (o_fn == 18 || o_fn == 21|| o_fn == 24) {
                 bool has_residual = false;
                 std::vector<float> secondary_data;
 
                 if (o_fn == 18) {
-                    int residual_source_id = this->cnnmodel->all_layer_size[c_layer][1]; 
+                    int residual_source_id = this->cnnmodel->all_layer_size[c_layer][1];
                     if (layer_outputs_history.find(residual_source_id) != layer_outputs_history.end() && !layer_outputs_history[residual_source_id].empty()) {
                         secondary_data = layer_outputs_history[residual_source_id][0];
                         has_residual = true;
@@ -526,69 +646,74 @@ void MACnet::inject_cNoC_traffic() {
 
                 for (int k = 0; k < this->tasks_in_current_chunk; k++) {
                     int base_idx = y * this->in_x + this->chunk_start_task_idx + k;
-                    
-                    comp_msg.data.push_back(this->input_table[0][base_idx]); 
-                    
+
+                    comp_msg.data.push_back(this->input_table[0][base_idx]);
+
                     if (o_fn == 18 && has_residual) {
-                        comp_msg.data.push_back(secondary_data[base_idx]); 
+                        comp_msg.data.push_back(secondary_data[base_idx]);
                     } else if (o_fn == 21 || o_fn == 24) {
-                        comp_msg.data.push_back(this->input_table[0][base_idx + o_x]); 
+                        comp_msg.data.push_back(this->input_table[0][base_idx + o_x]);
                     } else {
-                        comp_msg.data.push_back(0.0f); 
+                        comp_msg.data.push_back(0.0f);
                     }
                 }
             } else {
                 if (this->input_table.size() > 0 && this->input_table[0].size() >= token_end) {
                     comp_msg.data.reserve(token_end - token_start + this->tasks_in_current_chunk);
                     comp_msg.data.assign(
-                        this->input_table[0].begin() + token_start, 
+                        this->input_table[0].begin() + token_start,
                         this->input_table[0].begin() + token_end
                     );
                 }
             }
-            
+
             if (o_fn == MATMUL || o_fn == ATTENTION) {
                 comp_msg.psum_offset = comp_msg.data.size();
                 if (o_fn == ATTENTION) {
                     comp_msg.k_dim = cnnmodel->all_layer_size[c_layer][2];
-                }          
+                }
 #if USE_BIAS
                 if (o_fn == MATMUL) {
                     for(size_t b = 0; b < this->tasks_in_current_chunk; b++) {
-                        comp_msg.data.push_back(this->weight_table[this->chunk_start_task_idx + b].back()); 
+                        comp_msg.data.push_back(this->weight_table[this->chunk_start_task_idx + b].back());
                     }
                 } else {
-                    comp_msg.data.insert(comp_msg.data.end(), this->tasks_in_current_chunk, 0.0f); 
+                    comp_msg.data.insert(comp_msg.data.end(), this->tasks_in_current_chunk, 0.0f);
                 }
 #else
-                comp_msg.data.insert(comp_msg.data.end(), this->tasks_in_current_chunk, 0.0f); 
+                comp_msg.data.insert(comp_msg.data.end(), this->tasks_in_current_chunk, 0.0f);
 #endif
-                
+
             } else {
                 comp_msg.psum_offset = 0;
             }
-            
+
             comp_msg.data_length = comp_msg.data.size();
-            
+
             Packet* p = Packet::allocate(std::move(comp_msg), X_NUM, mem_ni->NI_num);
 
             int memory_latency = std::ceil(comp_msg.data_length * MEM_read_delay) + CACHE_DELAY;
-            p->send_out_time = cycles + memory_latency; 
-            
+            p->send_out_time = cycles + memory_latency;
+
             p->in_net_time = cycles;
             mem_ni->packetBuffer_list[p->vnet]->enqueue(p);
+            injected_comp++;
         }
-        
+        cout << "[cNoC][phase2->wait] cycle=" << cycles
+             << " layer=" << c_layer
+             << " comp_packets=" << injected_comp
+             << " wait_counter_start=" << (3 + this->in_y)
+             << endl;
         cnoc_phase = 3 + this->in_y;
     }
 }
 
 void MACnet::checkStatus()
 {
-    if(readyflag == 0) 
+    if(readyflag == 0)
     {
         this->create_input();
-        
+
         if (this->cnnmodel->all_layer_type[c_layer] == 'l') {
             precalc_mean.assign(o_y, 0.0);
             precalc_var.assign(o_y, 0.0);
@@ -622,7 +747,7 @@ void MACnet::checkStatus()
         if (l_type == 'm' || l_type == 'a' || l_type == 'w'|| l_type == 'g' || l_type == 't') {
             this->cNoC_mapping(total_tasks_in_layer);
         } else {
-            this->mapping(task_num); 
+            this->mapping(task_num);
             this->tiling_active = false;
         }
 #else
@@ -640,15 +765,15 @@ void MACnet::checkStatus()
             }
 
             this->MAC_list[i]->local_sram_usage = 0;
-            this->MAC_list[i]->kv_cache.clear(); 
+            this->MAC_list[i]->kv_cache.clear();
             this->MAC_list[i]->cached_score_row = -1;
             this->MAC_list[i]->cached_score_head = -1;
         }
 
-        readyflag = 1; 
+        readyflag = 1;
         return;
     }
-    
+
     for(int i=0; i<macNum; i++){
         if(MAC_list[i]->selfstatus != 5) {
             readyflag = 1;
@@ -663,17 +788,17 @@ void MACnet::checkStatus()
         }
 #endif
     }
-    
+
 #ifdef cNoC_MODE
     if (cnoc_phase != 0) {
         readyflag = 1;
         return;
     }
 #endif
-    
+
     deque<int> layer_info;
-    in_x = o_x; in_y = o_y; in_ch = o_ch; 
-    
+    in_x = o_x; in_y = o_y; in_ch = o_ch;
+
     layer_outputs_history[c_layer] = std::move(output_table);
 
     std::vector<int> layers_to_delete;
@@ -682,7 +807,7 @@ void MACnet::checkStatus()
         bool is_needed = false;
 
         for (int future_l = c_layer + 1; future_l < n_layer; future_l++) {
-            if (this->cnnmodel->all_layer_type[future_l] == 'a') { 
+            if (this->cnnmodel->all_layer_type[future_l] == 'a') {
                 int required_src = this->cnnmodel->all_layer_size[future_l][1];
                 if (required_src == saved_id) {
                     is_needed = true;
@@ -708,7 +833,7 @@ void MACnet::checkStatus()
         vcNetwork->clearAllRouterSRAM();
     }
 
-    c_layer++; 
+    c_layer++;
     if(c_layer == n_layer) {
         cout << "All finished! at cycle " << cycles << endl;
         output_table = layer_outputs_history[c_layer - 1];
@@ -734,14 +859,14 @@ void MACnet::checkStatus()
 
     layer_info = cnnmodel->all_layer_size[c_layer];
     if(cnnmodel->all_layer_type[c_layer]=='c') {
-        w_x = layer_info[1]; w_y = layer_info[2]; o_ch = layer_info[3]; 
-        w_ch = o_ch * in_ch; o_fn = layer_info[5]; pad = layer_info[6]; stride = layer_info[7]; 
+        w_x = layer_info[1]; w_y = layer_info[2]; o_ch = layer_info[3];
+        w_ch = o_ch * in_ch; o_fn = layer_info[5]; pad = layer_info[6]; stride = layer_info[7];
         assert((in_ch == layer_info[4]) && "Input channel not correct!");
         o_x = (in_x + 2*pad - w_x) / stride + 1;
         o_y = (in_y + 2*pad - w_y) / stride + 1;
     }
     else if(cnnmodel->all_layer_type[c_layer]=='f') {
-        in_x = layer_info[0]; in_ch = 1; in_y = 1; w_x = layer_info[0]; 
+        in_x = layer_info[0]; in_ch = 1; in_y = 1; w_x = layer_info[0];
         w_y = 1; o_ch = 1; w_ch = layer_info[1]; o_fn = layer_info[2] + 4; pad = 0; stride = 1;
         assert((in_x == w_x) && "Input channel not correct!");
         o_x = layer_info[1]; o_y = 1;
@@ -754,9 +879,9 @@ void MACnet::checkStatus()
             this->output_table[0].assign(temp_out_table.begin(), temp_out_table.end());
         }
     } else if(cnnmodel->all_layer_type[c_layer]=='p') {
-        w_x = layer_info[1]; w_y = layer_info[2]; o_ch = layer_info[3]; 
-        pad = layer_info[4]; stride = layer_info[5]; w_ch = 0; o_fn = 8; 
-        if (layer_info[6] == 2) {o_fn = 12;} 
+        w_x = layer_info[1]; w_y = layer_info[2]; o_ch = layer_info[3];
+        pad = layer_info[4]; stride = layer_info[5]; w_ch = 0; o_fn = 8;
+        if (layer_info[6] == 2) {o_fn = 12;}
         assert((in_ch == o_ch) && "Input channel not correct!");
         o_x = (in_x + 2*pad - w_x) / stride + 1; o_y = (in_y + 2*pad - w_y) / stride + 1;
     }
@@ -776,7 +901,7 @@ void MACnet::checkStatus()
     for(int i=0; i<macNum; i++){
         MAC_list[i]->selfstatus = 0;
         MAC_list[i]->pecycle = cycles;
-    }   
+    }
     return;
 }
 
@@ -791,7 +916,7 @@ void MACnet::runOneStep()
     MAC * tmpMAC;
     NI * tmpNI;
     Packet * tmpPacket;
-    for(int i=0; i<macNum; i++){ 
+    for(int i=0; i<macNum; i++){
         MAC_list[i]->runOneStep();
     }
 
@@ -800,15 +925,15 @@ void MACnet::runOneStep()
     int pid;
     int mem_id;
     int src_mac;
-    
+
     for(int memidx=0;memidx<MEM_NODES;memidx++)
     {
         mem_id = dest_list[memidx];
         tmpNI = this->vcNetwork->NI_list[mem_id];
-        
+
         for (auto it = tmpNI->packet_buffer_out[0].begin(); it != tmpNI->packet_buffer_out[0].end(); ) {
             tmpPacket = *it;
-            
+
 #ifdef cNoC_MODE
             if (tmpPacket->message.type == 5 && tmpPacket->message.out_cycle <= cycles) {
                 int y = tmpPacket->message.sequence_id;
@@ -817,25 +942,36 @@ void MACnet::runOneStep()
                 int c_offset = tmpPacket->message.chunk_start_idx;
                 int k_count = this->tasks_in_current_chunk;
 
-                if (tmpPacket->message.compute_op == ATTENTION) {                      
+                if (tmpPacket->message.compute_op == ATTENTION) {
                     double final_denominator = tmpPacket->message.running_sum;
                     double epsilon = 1e-9;
                     if (final_denominator < epsilon) final_denominator = epsilon;
 
-                    for(size_t k = 0; k < k_count; k++) { 
+                    for(size_t k = 0; k < k_count; k++) {
                         tmpPacket->message.data[p_offset + k] /= final_denominator;
                     }
                 }
-                
+
                 // Saving data by extracting from 'data'
                 for(size_t k = 0; k < k_count; k++) {
-                    int out_idx = (y * o_x) + c_offset + k;                                                              
+                    int out_idx = (y * o_x) + c_offset + k;
                     if (out_idx < this->output_table[0].size()) {
-                        
+#if CNOC_QUANT_GOLDEN
+                        int q_idx = (tmpPacket->message.compute_op == ADD ||
+                                     tmpPacket->message.compute_op == SWIGLU ||
+                                     tmpPacket->message.compute_op == GEGLU) ?
+                                    static_cast<int>(k * 2) :
+                                    static_cast<int>(p_offset + k);
+                        if (q_idx >= 0 &&
+                            q_idx < static_cast<int>(tmpPacket->message.cnoc_qdata.size())) {
+                            this->output_table[0][out_idx] =
+                                CNoCQuant::dequantize(tmpPacket->message.cnoc_qdata[q_idx]);
+                        }
+#else
                         if (tmpPacket->message.compute_op == ADD) {
                             // Add operation is linear, it has been computed in-transit in the router
                             this->output_table[0][out_idx] = tmpPacket->message.data[k * 2];
-                        } 
+                        }
                         else if (tmpPacket->message.compute_op == SWIGLU || tmpPacket->message.compute_op == GEGLU) {
                             // Non linear calculation at the terminal node (Terminal Node Concept)
                             // We read the raw data transported by the cNoC and compute here
@@ -852,30 +988,31 @@ void MACnet::runOneStep()
                         }
                         else {
                             // MATMUL, LINEAR and ATTENTION
-                            this->output_table[0][out_idx] = tmpPacket->message.data[p_offset + k]; 
+                            this->output_table[0][out_idx] = tmpPacket->message.data[p_offset + k];
                         }
+#endif
                     }
                 }
-                
+
                 cnoc_phase--;
-                
-                if (cnoc_phase == 3) { 
+
+                if (cnoc_phase == 3) {
                     if (this->tiling_active && this->last_mapped_task_idx < this->total_tasks_in_layer) {
-                        
+
                         this->vcNetwork->clearAllRouterSRAM();
                         this->cNoC_mapping(this->total_tasks_in_layer);
-                    } 
+                    }
                     else {
-                        cnoc_phase = 0; 
+                        cnoc_phase = 0;
                         for(int m=0; m<macNum; m++){
-                            MAC_list[m]->selfstatus = 5; 
+                            MAC_list[m]->selfstatus = 5;
 #ifdef only3type
                             MAC_list[m]->send = 3;
 #endif
                         }
                     }
                 }
-                
+
                 it = tmpNI->packet_buffer_out[0].erase(it);
                 Packet::release(tmpPacket);
                 continue;
@@ -903,12 +1040,12 @@ void MACnet::runOneStep()
             }
 #endif
             tmpMAC = MAC_list[src_mac];
-            
-            if(this->cnnmodel->all_layer_type[c_layer]=='c'){ 
-                if(tmpMAC->selfstatus == 2) 
+
+            if(this->cnnmodel->all_layer_type[c_layer]=='c'){
+                if(tmpMAC->selfstatus == 2)
                 {
-                    tmpMAC->tmpch = tmpMAC->request / (o_x*o_y); 
-                    tmpMAC->tmpm  = tmpMAC->request % (o_x*o_y); 
+                    tmpMAC->tmpch = tmpMAC->request / (o_x*o_y);
+                    tmpMAC->tmpm  = tmpMAC->request % (o_x*o_y);
                     tmpMAC->npoolflag = 0;
                     int tmpx = tmpMAC->tmpm % o_x;
                     int tmpy = tmpMAC->tmpm / o_x;
@@ -916,7 +1053,7 @@ void MACnet::runOneStep()
                     tmpMAC->inbuffer.push_back(o_fn);
                     tmpMAC->inbuffer.push_back(in_ch);
                     tmpMAC->inbuffer.push_back(w_x * w_y);
-                    
+
                     for (int k=0; k<in_ch; k++) {
                         for (int p=0; p<w_y; p++) {
                             tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[k].begin() + (tmpy*stride+p)*(in_x+2*pad) + tmpx*stride, this->input_table[k].begin() + (tmpy*stride+p)*(in_x+2*pad) + tmpx*stride + w_x);
@@ -925,7 +1062,7 @@ void MACnet::runOneStep()
                     for (int k=0; k<in_ch; k++) {
                         tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(),this->weight_table[tmpMAC->tmpch*in_ch+k].begin(), this->weight_table[tmpMAC->tmpch*in_ch+k].end()-1);
                     }
-                    tmpMAC->inbuffer.push_back(this->weight_table[tmpMAC->tmpch*in_ch].back()); 
+                    tmpMAC->inbuffer.push_back(this->weight_table[tmpMAC->tmpch*in_ch].back());
 #ifdef newpooling
                     if (this->cnnmodel->all_layer_type[c_layer+1]=='p')
                     {
@@ -936,7 +1073,7 @@ void MACnet::runOneStep()
                             tmpMAC->n_tmpm.clear();
                             tmpMAC->inbuffer.assign(4, 10);
                         } else {
-                            tmpMAC->n_tmpch = tmpMAC->tmpch; 
+                            tmpMAC->n_tmpch = tmpMAC->tmpch;
                             for(n_tmpx=0; n_tmpx<no_x;n_tmpx++){
                                 for(n_tmpy=0; n_tmpy<no_y;n_tmpy++){
                                     if(tmpx >= n_tmpx*nstride && tmpx < n_tmpx*nstride + nw_x && tmpy >= n_tmpy*nstride && tmpy < n_tmpy*nstride + nw_y)
@@ -950,16 +1087,16 @@ void MACnet::runOneStep()
                     MAC_list[mem_id]->inject(1,src,tmpMAC->inbuffer.size(),o_fn,vcNetwork->NI_list[mem_id],pid,src_mac);
                 }
             }
-            else if (this->cnnmodel->all_layer_type[c_layer]=='p') 
+            else if (this->cnnmodel->all_layer_type[c_layer]=='p')
             {
-                if(tmpMAC->selfstatus == 2) 
+                if(tmpMAC->selfstatus == 2)
                 {
-                    tmpMAC->tmpch = tmpMAC->request / (o_x*o_y); 
-                    tmpMAC->tmpm  = tmpMAC->request % (o_x*o_y); 
+                    tmpMAC->tmpch = tmpMAC->request / (o_x*o_y);
+                    tmpMAC->tmpm  = tmpMAC->request % (o_x*o_y);
                     int tmpx = tmpMAC->tmpm % o_x;
                     int tmpy = tmpMAC->tmpm / o_x;
                     tmpMAC->inbuffer.clear();
-                    tmpMAC->inbuffer.push_back(o_fn); 
+                    tmpMAC->inbuffer.push_back(o_fn);
                     tmpMAC->inbuffer.push_back(w_x * w_y);
                     for (int p=0; p<w_y; p++) {
                         tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[tmpMAC->tmpch].begin() + (tmpy*stride+p)*(in_x+2*pad) + tmpx*stride, this->input_table[tmpMAC->tmpch].begin() + (tmpy*stride+p)*(in_x+2*pad) + tmpx*stride + w_x);
@@ -968,71 +1105,71 @@ void MACnet::runOneStep()
                     MAC_list[mem_id]->inject(1,src,tmpMAC->inbuffer.size(),o_fn,vcNetwork->NI_list[mem_id],pid,src_mac);
                 }
             }
-            else if (this->cnnmodel->all_layer_type[c_layer]=='f'){ 
-                if(tmpMAC->selfstatus == 2) 
+            else if (this->cnnmodel->all_layer_type[c_layer]=='f'){
+                if(tmpMAC->selfstatus == 2)
                 {
-                    tmpMAC->tmpch = 0; 
-                    tmpMAC->tmpm  = tmpMAC->request; 
+                    tmpMAC->tmpch = 0;
+                    tmpMAC->tmpm  = tmpMAC->request;
                     tmpMAC->npoolflag = 0;
                     tmpMAC->inbuffer.clear();
                     tmpMAC->inbuffer.push_back(o_fn);
                     tmpMAC->inbuffer.push_back(w_x * w_y);
                     tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[0].begin(), this->input_table[0].end());
-                    tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(),this->weight_table[tmpMAC->tmpm].begin(), this->weight_table[tmpMAC->tmpm].end()); 
-                    
+                    tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(),this->weight_table[tmpMAC->tmpm].begin(), this->weight_table[tmpMAC->tmpm].end());
+
                     MAC_list[mem_id]->pecycle = cycles + ceil((w_x * w_y * 2 + 1) * MEM_read_delay) + CACHE_DELAY;
                     MAC_list[mem_id]->inject(1,src,tmpMAC->inbuffer.size(),o_fn,vcNetwork->NI_list[mem_id],pid,src_mac);
                 }
             }
-            else if (this->cnnmodel->all_layer_type[c_layer]=='m' || this->cnnmodel->all_layer_type[c_layer]=='l' || 
-                    this->cnnmodel->all_layer_type[c_layer]=='s' || this->cnnmodel->all_layer_type[c_layer]=='a' || 
-                    this->cnnmodel->all_layer_type[c_layer]=='e' || this->cnnmodel->all_layer_type[c_layer]=='r' || 
-                    this->cnnmodel->all_layer_type[c_layer]=='w' || this->cnnmodel->all_layer_type[c_layer]=='o' || 
+            else if (this->cnnmodel->all_layer_type[c_layer]=='m' || this->cnnmodel->all_layer_type[c_layer]=='l' ||
+                    this->cnnmodel->all_layer_type[c_layer]=='s' || this->cnnmodel->all_layer_type[c_layer]=='a' ||
+                    this->cnnmodel->all_layer_type[c_layer]=='e' || this->cnnmodel->all_layer_type[c_layer]=='r' ||
+                    this->cnnmodel->all_layer_type[c_layer]=='w' || this->cnnmodel->all_layer_type[c_layer]=='o' ||
                     this->cnnmodel->all_layer_type[c_layer]=='t' || this->cnnmodel->all_layer_type[c_layer]=='g')
             {
-                if(tmpMAC->selfstatus == 2) 
+                if(tmpMAC->selfstatus == 2)
                 {
-                    tmpMAC->tmpch = 0; 
-                    tmpMAC->tmpm  = tmpMAC->request; 
+                    tmpMAC->tmpch = 0;
+                    tmpMAC->tmpm  = tmpMAC->request;
                     tmpMAC->npoolflag = 0;
                     tmpMAC->inbuffer.clear();
 
                     int tmpy = tmpMAC->tmpm / o_x;
                     int tmpx = tmpMAC->tmpm % o_x;
 
-                    if (o_fn == MATMUL) { 
+                    if (o_fn == MATMUL) {
                         tmpMAC->inbuffer.push_back(o_fn);
                         tmpMAC->inbuffer.push_back(in_x);
-                        tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[0].begin() + tmpy*in_x, this->input_table[0].begin() + tmpy*in_x + in_x); 
-                        tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->weight_table[tmpx].begin(), this->weight_table[tmpx].end()); 
+                        tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[0].begin() + tmpy*in_x, this->input_table[0].begin() + tmpy*in_x + in_x);
+                        tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->weight_table[tmpx].begin(), this->weight_table[tmpx].end());
                     }
-                    else if (o_fn == LAYERNORM) { 
+                    else if (o_fn == LAYERNORM) {
                         tmpMAC->inbuffer.push_back(o_fn);
                         tmpMAC->inbuffer.push_back(in_x);
                         float mean = this->precalc_mean[tmpy];
                         float var = this->precalc_var[tmpy];
                         tmpMAC->inbuffer.push_back(mean);
                         tmpMAC->inbuffer.push_back(var);
-                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + tmpx]); 
-                        tmpMAC->inbuffer.push_back(this->weight_table[0][tmpx]);            
-                        tmpMAC->inbuffer.push_back(this->weight_table[1][tmpx]);            
+                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + tmpx]);
+                        tmpMAC->inbuffer.push_back(this->weight_table[0][tmpx]);
+                        tmpMAC->inbuffer.push_back(this->weight_table[1][tmpx]);
                     }
-                    else if (o_fn == SOFTMAX_TR) { 
+                    else if (o_fn == SOFTMAX_TR) {
                         tmpMAC->inbuffer.push_back(o_fn);
                         tmpMAC->inbuffer.push_back(in_x);
-                        tmpMAC->inbuffer.push_back(causal_mask_flag); 
-                        tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[0].begin() + tmpy*in_x, this->input_table[0].begin() + tmpy*in_x + in_x); 
+                        tmpMAC->inbuffer.push_back(causal_mask_flag);
+                        tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[0].begin() + tmpy*in_x, this->input_table[0].begin() + tmpy*in_x + in_x);
                     }
-                    else if (o_fn == ADD) { 
+                    else if (o_fn == ADD) {
                         tmpMAC->inbuffer.push_back(o_fn);
                         tmpMAC->inbuffer.push_back(in_x);
-                        tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[0].begin() + tmpy*in_x, this->input_table[0].begin() + tmpy*in_x + in_x); 
-                        int residual_source_id = this->cnnmodel->all_layer_size[c_layer][1]; 
+                        tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[0].begin() + tmpy*in_x, this->input_table[0].begin() + tmpy*in_x + in_x);
+                        int residual_source_id = this->cnnmodel->all_layer_size[c_layer][1];
                         if (layer_outputs_history.find(residual_source_id) == layer_outputs_history.end()) {
                             residual_source_id = (c_layer > 0) ? (c_layer - 1) : 0;
                         }
                         if (layer_outputs_history[residual_source_id].empty()) {
-                            tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), in_x, 0.0); 
+                            tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), in_x, 0.0);
                         } else {
                             auto& residual_data = layer_outputs_history[residual_source_id][0];
                             int required_size = (tmpy * in_x) + in_x;
@@ -1043,91 +1180,91 @@ void MACnet::runOneStep()
                             }
                         }
                     }
-                    else if (o_fn == EMBEDDING) { 
+                    else if (o_fn == EMBEDDING) {
                         tmpMAC->inbuffer.push_back(o_fn);
                         tmpMAC->inbuffer.push_back(w_x);
-                        int token_id = (int)this->input_table[0][tmpy]; 
+                        int token_id = (int)this->input_table[0][tmpy];
                         assert(token_id >= 0 && token_id < (int)weight_table.size() && "Token ID out of vocab range");
                         tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->weight_table[token_id].begin(), this->weight_table[token_id].end());
                     }
-                    else if (o_fn == RMSNORM) { 
+                    else if (o_fn == RMSNORM) {
                         tmpMAC->inbuffer.push_back(o_fn);
                         tmpMAC->inbuffer.push_back(in_x);
                         float rms = this->precalc_rms[tmpy];
                         tmpMAC->inbuffer.push_back(rms);
-                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + tmpx]); 
-                        tmpMAC->inbuffer.push_back(this->weight_table[0][tmpx]);            
+                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + tmpx]);
+                        tmpMAC->inbuffer.push_back(this->weight_table[0][tmpx]);
                     }
-                    else if (o_fn == SWIGLU || o_fn == GEGLU) { 
+                    else if (o_fn == SWIGLU || o_fn == GEGLU) {
                         tmpMAC->inbuffer.push_back(o_fn);
-                        tmpMAC->inbuffer.push_back(o_x); 
-                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + tmpx]);       
-                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + tmpx + o_x]); 
+                        tmpMAC->inbuffer.push_back(o_x);
+                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + tmpx]);
+                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + tmpx + o_x]);
                     }
-                    else if (o_fn == ROPE) { 
+                    else if (o_fn == ROPE) {
                         tmpMAC->inbuffer.push_back(o_fn);
                         tmpMAC->inbuffer.push_back(in_x);
                         tmpMAC->inbuffer.push_back(tmpy);
                         int q_dim = this->cnnmodel->all_layer_size[c_layer][1];
                         int n_heads = this->cnnmodel->all_layer_size[c_layer][3];
-                        int head_dim = q_dim / n_heads; 
+                        int head_dim = q_dim / n_heads;
                         tmpMAC->inbuffer.push_back(head_dim);
                         int head_id = tmpx / head_dim;
                         int d = tmpx % head_dim;
                         int half_dim = head_dim / 2;
                         int pair_d = (d < half_dim) ? (d + half_dim) : (d - half_dim);
                         int pair_idx = (head_id * head_dim) + pair_d;
-                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + tmpx]);     
-                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + pair_idx]); 
+                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + tmpx]);
+                        tmpMAC->inbuffer.push_back(this->input_table[0][tmpy*in_x + pair_idx]);
                     }
-                    else if (o_fn == ATTENTION) { 
+                    else if (o_fn == ATTENTION) {
                         int fused_dim = this->cnnmodel->all_layer_size[c_layer][0];
                         int q_dim =     this->cnnmodel->all_layer_size[c_layer][1];
                         int k_dim =     this->cnnmodel->all_layer_size[c_layer][2];
                         int n_heads =   this->cnnmodel->all_layer_size[c_layer][3];
-                        
+
                         tmpMAC->inbuffer.push_back(o_fn);
                         tmpMAC->inbuffer.push_back(fused_dim);
                         tmpMAC->inbuffer.push_back(q_dim);
                         tmpMAC->inbuffer.push_back(k_dim);
                         tmpMAC->inbuffer.push_back(n_heads);
-                        tmpMAC->inbuffer.push_back(tmpy); 
-                        tmpMAC->inbuffer.push_back(tmpx); 
-                        int limit = tmpy + 1; 
-                        tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[0].begin(), this->input_table[0].begin() + limit * fused_dim); 
+                        tmpMAC->inbuffer.push_back(tmpy);
+                        tmpMAC->inbuffer.push_back(tmpx);
+                        int limit = tmpy + 1;
+                        tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[0].begin(), this->input_table[0].begin() + limit * fused_dim);
                     }
 
                     int payload_size = tmpMAC->inbuffer.size();
 #if ENABLE_KV_CACHE == 1
-                    if (o_fn == ATTENTION) { 
+                    if (o_fn == ATTENTION) {
                         int fused_dim = this->cnnmodel->all_layer_size[c_layer][0];
                         int k_dim = this->cnnmodel->all_layer_size[c_layer][2];
-                        int kv_size_per_token = k_dim * 2; 
+                        int kv_size_per_token = k_dim * 2;
                         int tokens_in_cache = tmpMAC->local_sram_usage / kv_size_per_token;
                         bool is_autoregressive = (tmpy > 0);
-                        
+
                         if (is_autoregressive && tokens_in_cache >= tmpy) {
-                            int header_size = 7; 
-                            payload_size = header_size + fused_dim; 
+                            int header_size = 7;
+                            payload_size = header_size + fused_dim;
                             tmpMAC->inbuffer.clear();
                             tmpMAC->inbuffer.push_back(o_fn);
                             tmpMAC->inbuffer.push_back(fused_dim);
-                            tmpMAC->inbuffer.push_back(this->cnnmodel->all_layer_size[c_layer][1]); 
+                            tmpMAC->inbuffer.push_back(this->cnnmodel->all_layer_size[c_layer][1]);
                             tmpMAC->inbuffer.push_back(k_dim);
-                            tmpMAC->inbuffer.push_back(this->cnnmodel->all_layer_size[c_layer][3]); 
+                            tmpMAC->inbuffer.push_back(this->cnnmodel->all_layer_size[c_layer][3]);
                             tmpMAC->inbuffer.push_back(tmpy);
                             tmpMAC->inbuffer.push_back(tmpx);
                             tmpMAC->inbuffer.insert(tmpMAC->inbuffer.end(), this->input_table[0].begin() + tmpy * fused_dim, this->input_table[0].begin() + (tmpy + 1) * fused_dim);
                             int expected_sram = (tmpy + 1) * kv_size_per_token;
                             if (tmpMAC->local_sram_usage < expected_sram) {
                                 if (expected_sram <= KV_CACHE_SIZE) tmpMAC->local_sram_usage = expected_sram;
-                                else tmpMAC->local_sram_usage = KV_CACHE_SIZE; 
+                                else tmpMAC->local_sram_usage = KV_CACHE_SIZE;
                             }
                         } else {
                             payload_size = tmpMAC->inbuffer.size();
                             int required_sram = (tmpy + 1) * kv_size_per_token;
                             if (required_sram <= KV_CACHE_SIZE) tmpMAC->local_sram_usage = required_sram;
-                            else tmpMAC->local_sram_usage = KV_CACHE_SIZE; 
+                            else tmpMAC->local_sram_usage = KV_CACHE_SIZE;
                         }
                     }
 #endif
@@ -1161,11 +1298,11 @@ void MACnet::runOneStep()
             }
 #endif
 
-            if(this->cnnmodel->all_layer_type[c_layer]=='c'){ 
+            if(this->cnnmodel->all_layer_type[c_layer]=='c'){
 #ifdef newpooling
                 if(this->cnnmodel->all_layer_type[c_layer+1]=='p') {
                     if(tmpPacket->message.data[0] >= this->output_table[tmpPacket->message.data[1]][tmpPacket->message.data[2]]) {
-                        this->output_table[tmpPacket->message.data[1]][tmpPacket->message.data[2]] = tmpPacket->message.data[0]; 
+                        this->output_table[tmpPacket->message.data[1]][tmpPacket->message.data[2]] = tmpPacket->message.data[0];
                     }
                     if(tmpMAC->selfstatus == 5) tmpMAC->send = 3;
                 } else {
@@ -1200,7 +1337,7 @@ void MACnet::runOneStep()
                 if(tmpMAC->selfstatus == 5) tmpMAC->send = 3;
 #endif
             }
-            else if(this->cnnmodel->all_layer_type[c_layer]=='f'){ 
+            else if(this->cnnmodel->all_layer_type[c_layer]=='f'){
 #ifndef only3type
                 if(tmpMAC->selfstatus == 4) {
                     if(tmpMAC->send == 1) {
@@ -1214,10 +1351,10 @@ void MACnet::runOneStep()
                 if(tmpMAC->selfstatus == 5) tmpMAC->send = 3;
 #endif
             }
-            else if(this->cnnmodel->all_layer_type[c_layer]=='m' || this->cnnmodel->all_layer_type[c_layer]=='l' || 
-                     this->cnnmodel->all_layer_type[c_layer]=='s' || this->cnnmodel->all_layer_type[c_layer]=='a' || 
-                     this->cnnmodel->all_layer_type[c_layer]=='e' || this->cnnmodel->all_layer_type[c_layer]=='r' || 
-                     this->cnnmodel->all_layer_type[c_layer]=='w' || this->cnnmodel->all_layer_type[c_layer]=='o' || 
+            else if(this->cnnmodel->all_layer_type[c_layer]=='m' || this->cnnmodel->all_layer_type[c_layer]=='l' ||
+                     this->cnnmodel->all_layer_type[c_layer]=='s' || this->cnnmodel->all_layer_type[c_layer]=='a' ||
+                     this->cnnmodel->all_layer_type[c_layer]=='e' || this->cnnmodel->all_layer_type[c_layer]=='r' ||
+                     this->cnnmodel->all_layer_type[c_layer]=='w' || this->cnnmodel->all_layer_type[c_layer]=='o' ||
                      this->cnnmodel->all_layer_type[c_layer]=='t' || this->cnnmodel->all_layer_type[c_layer]=='g'){
 #ifndef only3type
                 if(tmpMAC->selfstatus == 4) {
@@ -1244,7 +1381,7 @@ void MACnet::runOneStep()
             if (dest_list[m] < TOT_NUM) {
                 is_dest[dest_list[m]] = true;
             } else {
-                std::cerr << "\n[FATAL ERROR] Node ID in dest_list (" << dest_list[m] 
+                std::cerr << "\n[FATAL ERROR] Node ID in dest_list (" << dest_list[m]
                           << ") supera il limite della rete TOT_NUM (" << TOT_NUM << ")!\n";
                 exit(EXIT_FAILURE);
             }
@@ -1258,7 +1395,7 @@ void MACnet::runOneStep()
         tmpNI = this->vcNetwork->NI_list[i];
         for (auto it = tmpNI->packet_buffer_out[0].begin(); it != tmpNI->packet_buffer_out[0].end(); ) {
             tmpPacket = *it;
-            
+
 #ifdef cNoC_MODE
             if (tmpPacket->message.type == 4) {
                 it = tmpNI->packet_buffer_out[0].erase(it);
@@ -1272,7 +1409,7 @@ void MACnet::runOneStep()
                 ++it;
                 continue;
             }
-            src_mac = tmpPacket->message.mac_id; 
+            src_mac = tmpPacket->message.mac_id;
             pid = tmpPacket->message.signal_id;
 
 #ifdef Countlatency

@@ -4,10 +4,101 @@
  */
 
 #include "VCRouter.hpp"
+#include "../CNoCQuant.hpp"
 #include "../parameters.hpp"
+#include "../rtl/VerilatedRouter.hpp"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
+
+namespace {
+
+bool isCnocQuantPacket(const Flit* flit) {
+#if CNOC_QUANT_GOLDEN
+    return flit != nullptr &&
+           flit->packet != nullptr &&
+           (flit->packet->message.type == 4 || flit->packet->message.type == 5);
+#else
+    (void)flit;
+    return false;
+#endif
+}
+
+void ensureCnocQData(Message& message) {
+#if CNOC_QUANT_GOLDEN
+    if ((message.type == 4 || message.type == 5) &&
+        message.cnoc_qdata.size() != message.data.size()) {
+        CNoCQuant::quantizeVector(message.data, message.cnoc_qdata);
+    }
+#else
+    (void)message;
+#endif
+}
+
+int32_t flitQData(const Flit* flit, int local_index) {
+#if CNOC_QUANT_GOLDEN
+    if (flit == nullptr || flit->packet == nullptr) {
+        return 0;
+    }
+    Message& message = flit->packet->message;
+    ensureCnocQData(message);
+    const int index = flit->global_data_offset + local_index;
+    if (index >= 0 && index < static_cast<int>(message.cnoc_qdata.size())) {
+        return message.cnoc_qdata[index];
+    }
+#else
+    (void)flit;
+    (void)local_index;
+#endif
+    return 0;
+}
+
+void writePacketQData(Flit* flit, int index, int32_t value_q) {
+#if CNOC_QUANT_GOLDEN
+    if (flit == nullptr || flit->packet == nullptr || index < 0) {
+        return;
+    }
+    Message& message = flit->packet->message;
+    ensureCnocQData(message);
+    if (index >= static_cast<int>(message.cnoc_qdata.size())) {
+        return;
+    }
+    message.cnoc_qdata[index] = value_q;
+    if (index < static_cast<int>(message.data.size())) {
+        message.data[index] = CNoCQuant::dequantize(value_q);
+    }
+#else
+    (void)flit;
+    (void)index;
+    (void)value_q;
+#endif
+}
+
+#if CNOC_QUANT_GOLDEN
+int cnocMatmulDebugSignal() {
+    static bool parsed = false;
+    static int signal = -1;
+    if (!parsed) {
+        parsed = true;
+        const char* env = std::getenv("CNOC_MATMUL_DEBUG_SIGNAL");
+        if (env != nullptr && *env != '\0') {
+            signal = std::atoi(env);
+        }
+    }
+    return signal;
+}
+
+bool shouldDebugMatmulFlit(const Flit* flit) {
+    const int signal = cnocMatmulDebugSignal();
+    return signal >= 0 &&
+           flit != nullptr &&
+           flit->packet != nullptr &&
+           flit->packet->message.signal_id == signal;
+}
+#endif
+
+}  // namespace
 
 VCRouter::VCRouter(int* t_id, int in_out_port_num, VCNetwork* t_vcNetwork, int t_vn_num, int t_vc_per_vn, int t_vc_priority_per_vn, int t_in_depth)
 {
@@ -21,6 +112,8 @@ VCRouter::VCRouter(int* t_id, int in_out_port_num, VCNetwork* t_vcNetwork, int t
     
     local_weights.clear();
     local_kv_cache.clear();
+    local_weights_q8.clear();
+    local_kv_cache_q8.clear();
 
     mfu_occupied_until = 0;
 
@@ -64,7 +157,14 @@ VCRouter::VCRouter(int* t_id, int in_out_port_num, VCNetwork* t_vcNetwork, int t
 
     local_kv_cache.reserve(ROUTER_SRAM_LIMIT);
     local_weights.reserve(ROUTER_SRAM_LIMIT);
+    local_kv_cache_q8.reserve(ROUTER_SRAM_LIMIT);
+    local_weights_q8.reserve(ROUTER_SRAM_LIMIT);
     kv_token_count = 0;
+
+    rtl_router = nullptr;
+    if (GlobalParams::enable_rtl_router) {
+        rtl_router = new VerilatedRouter(this);
+    }
 }
 
 int VCRouter::getRoute(Flit* t_flit){
@@ -104,6 +204,12 @@ int VCRouter::getRoute(Flit* t_flit){
 }
 
 void VCRouter::processDistributionPacket(Flit* t_flit) {
+#if CNOC_QUANT_GOLDEN
+    if (isCnocQuantPacket(t_flit)) {
+        processDistributionPacketQuant(t_flit);
+        return;
+    }
+#endif
     int payload_size = t_flit->get_payload_size();
     int opcode = t_flit->packet->message.compute_op;
 
@@ -187,7 +293,55 @@ void VCRouter::processDistributionPacket(Flit* t_flit) {
     }
 }
 
+void VCRouter::processDistributionPacketQuant(Flit* t_flit) {
+#if CNOC_QUANT_GOLDEN
+    int payload_size = t_flit->get_payload_size();
+    int opcode = t_flit->packet->message.compute_op;
+    ensureCnocQData(t_flit->packet->message);
+
+    if (opcode == ATTENTION) {
+        const int SINK_TOKENS = 4;
+        int values_per_token = std::max(1, t_flit->packet->message.data_length);
+        int max_tokens_in_sram = std::max(1, ROUTER_SRAM_LIMIT / values_per_token);
+
+        int base_offset = 0;
+        if (kv_token_count < max_tokens_in_sram) {
+            base_offset = kv_token_count * values_per_token;
+        } else {
+            int ring_index = 0;
+            if (max_tokens_in_sram > SINK_TOKENS) {
+                ring_index = SINK_TOKENS +
+                    ((kv_token_count - SINK_TOKENS) % (max_tokens_in_sram - SINK_TOKENS));
+            } else {
+                ring_index = max_tokens_in_sram - 1;
+            }
+            base_offset = ring_index * values_per_token;
+        }
+
+        for (int i = 0; i < payload_size; i++) {
+            writeKVQuant(base_offset + t_flit->global_data_offset + i, flitQData(t_flit, i));
+        }
+
+        if (t_flit->type == 1 || t_flit->type == 10) {
+            kv_token_count++;
+        }
+    } else {
+        for (int i = 0; i < payload_size; i++) {
+            storeWeightQuant(flitQData(t_flit, i));
+        }
+    }
+#else
+    (void)t_flit;
+#endif
+}
+
 void VCRouter::computeInTransit(Flit* t_flit, int port_idx) {
+#if CNOC_QUANT_GOLDEN
+    if (isCnocQuantPacket(t_flit)) {
+        computeInTransitQuant(t_flit, port_idx);
+        return;
+    }
+#endif
     int this_router_id = id[0] * X_NUM + id[1];
 
     // Avoid redundant executions of the same flit if it passes multiple times
@@ -405,6 +559,265 @@ void VCRouter::computeInTransit(Flit* t_flit, int port_idx) {
     }
 }
 
+void VCRouter::computeInTransitQuant(Flit* t_flit, int port_idx) {
+#if CNOC_QUANT_GOLDEN
+    int this_router_id = id[0] * X_NUM + id[1];
+    if (t_flit->computed_routers[this_router_id]) {
+        return;
+    }
+    t_flit->computed_routers[this_router_id] = true;
+    ensureCnocQData(t_flit->packet->message);
+
+    ComputeVCState& vc_state = vc_compute_state[port_idx][t_flit->vc];
+
+    if (t_flit->type == 0 || t_flit->type == 10) {
+        vc_state.reset();
+        vc_state.is_active = true;
+        vc_state.compute_op = t_flit->packet->message.compute_op;
+        vc_state.running_max = t_flit->packet->message.running_max;
+        vc_state.running_sum = t_flit->packet->message.running_sum;
+    }
+
+    if (!vc_state.is_active) {
+        return;
+    }
+
+    int payload_size = t_flit->get_payload_size();
+    // Attention is tail-triggered.  A tail flit may be padding-only after flit
+    // alignment, but it still carries the control event that traverses local KV
+    // state and updates running max/sum.  Other cNoC ops are payload-lane driven
+    // and can safely ignore empty padding flits.
+    if (payload_size <= 0 && vc_state.compute_op != ATTENTION) {
+        return;
+    }
+
+    switch (vc_state.compute_op) {
+        case MATMUL:
+        case LINEAR:
+        {
+            int num_tasks = assigned_tasks.size();
+            if (num_tasks == 0) break;
+            int weight_row_size = local_weights_q8.empty() ? 0 :
+                static_cast<int>(local_weights_q8.size()) / num_tasks;
+            if (weight_row_size <= 0) break;
+
+            if (vc_state.matmul_accum_q.size() != static_cast<size_t>(num_tasks)) {
+                vc_state.matmul_accum_q.assign(num_tasks, 0);
+            }
+
+            for (int t = 0; t < num_tasks; t++) {
+                int task_id = assigned_tasks[t];
+                int64_t local_accum_q4 = 0;
+
+                for (int i = 0; i < payload_size; ++i) {
+                    int input_idx = t_flit->global_data_offset + i;
+                    if (input_idx >= t_flit->packet->message.psum_offset) continue;
+
+                    int w_offset = (t * weight_row_size) + input_idx;
+                    if (w_offset < static_cast<int>(local_weights_q8.size())) {
+                        local_accum_q4 += CNoCQuant::mulQ4(flitQData(t_flit, i), local_weights_q8[w_offset]);
+                    }
+                }
+
+                const int32_t old_accum_q = vc_state.matmul_accum_q[t];
+                const int32_t next_accum_q =
+                    CNoCQuant::sat8(static_cast<int64_t>(old_accum_q) + local_accum_q4);
+                vc_state.matmul_accum_q[t] = next_accum_q;
+
+                int target_index = t_flit->packet->message.psum_offset + task_id;
+                const bool target_in_current_flit =
+                    target_index >= t_flit->global_data_offset &&
+                    target_index < t_flit->global_data_offset + payload_size;
+                const int32_t old_target_q =
+                    (target_index >= 0 &&
+                     target_index < static_cast<int>(t_flit->packet->message.cnoc_qdata.size())) ?
+                    t_flit->packet->message.cnoc_qdata[target_index] :
+                    0;
+                if (target_index >= 0 &&
+                    target_in_current_flit &&
+                    target_index < static_cast<int>(t_flit->packet->message.cnoc_qdata.size())) {
+                    int64_t updated =
+                        static_cast<int64_t>(t_flit->packet->message.cnoc_qdata[target_index]) +
+                        next_accum_q;
+                    // MatMul/Linear is now modeled as a hardware-visible
+                    // streaming operation: input flits update router-local VC
+                    // accumulator state, and only a flit that actually carries
+                    // the target psum lane can write that lane back.  This avoids
+                    // the old packet-global side effect where C++ updated
+                    // cnoc_qdata[psum_offset + task_id] even though no outgoing
+                    // flit carried that byte.
+                    writePacketQData(t_flit, target_index, CNoCQuant::sat8(updated));
+                }
+
+                if (shouldDebugMatmulFlit(t_flit)) {
+                    const int this_router_id = id[0] * X_NUM + id[1];
+                    std::cerr << "[CNOC_MATMUL_DEBUG][golden]"
+                              << " router=" << this_router_id
+                              << " signal_id=" << t_flit->packet->message.signal_id
+                              << " global_pid=" << t_flit->packet->global_pid
+                              << " flit_id=" << t_flit->id
+                              << " flit_type=" << t_flit->type
+                              << " vc=" << t_flit->vc
+                              << " data_offset=" << t_flit->global_data_offset
+                              << " payload_size=" << payload_size
+                              << " psum_offset=" << t_flit->packet->message.psum_offset
+                              << " weight_row_size=" << weight_row_size
+                              << " task_slot=" << t
+                              << " task_id=" << task_id
+                              << " local_accum_q=" << local_accum_q4
+                              << " old_accum_q=" << old_accum_q
+                              << " next_accum_q=" << next_accum_q
+                              << " target_index=" << target_index
+                              << " target_in_current_flit=" << target_in_current_flit
+                              << " old_target_q=" << old_target_q
+                              << " new_target_q="
+                              << ((target_in_current_flit &&
+                                   target_index >= 0 &&
+                                   target_index < static_cast<int>(t_flit->packet->message.cnoc_qdata.size())) ?
+                                  t_flit->packet->message.cnoc_qdata[target_index] :
+                                  old_target_q)
+                              << std::endl;
+                }
+            }
+            break;
+        }
+        case ADD:
+        {
+            int num_tasks = assigned_tasks.size();
+            for (int t = 0; t < num_tasks; t++) {
+                int task_id = assigned_tasks[t];
+                int required_flit_offset = task_id * 2;
+                if (required_flit_offset >= t_flit->global_data_offset &&
+                    required_flit_offset + 1 < t_flit->global_data_offset + payload_size) {
+                    int local_offset = required_flit_offset - t_flit->global_data_offset;
+                    int32_t result_q = CNoCQuant::addSatQ4(
+                        flitQData(t_flit, local_offset),
+                        flitQData(t_flit, local_offset + 1));
+                    writePacketQData(t_flit, required_flit_offset, result_q);
+                }
+            }
+            break;
+        }
+        case SWIGLU:
+        case GEGLU:
+        {
+            int num_tasks = assigned_tasks.size();
+            for (int t = 0; t < num_tasks; t++) {
+                int task_id = assigned_tasks[t];
+                int required_flit_offset = task_id * 2;
+                if (required_flit_offset >= t_flit->global_data_offset &&
+                    required_flit_offset + 1 < t_flit->global_data_offset + payload_size) {
+                    int local_offset = required_flit_offset - t_flit->global_data_offset;
+                    int32_t gate_q = flitQData(t_flit, local_offset);
+                    int32_t up_q = flitQData(t_flit, local_offset + 1);
+                    int32_t result_q = (vc_state.compute_op == SWIGLU) ?
+                        CNoCQuant::siluQ4(gate_q, up_q) :
+                        CNoCQuant::geluQ4(gate_q, up_q);
+                    writePacketQData(t_flit, required_flit_offset, result_q);
+                }
+            }
+            break;
+        }
+        case ATTENTION:
+        {
+            if (t_flit->type != 1 && t_flit->type != 10) break;
+            if (local_kv_cache_q8.empty()) break;
+
+            const int k_dim =
+                (t_flit->packet->message.k_dim > 0) ?
+                t_flit->packet->message.k_dim :
+                t_flit->packet->message.psum_offset;
+            if (k_dim <= 0) break;
+            const int num_local_tokens =
+                static_cast<int>(local_kv_cache_q8.size()) / (k_dim * 2);
+            if (num_local_tokens <= 0) break;
+
+            std::vector<int32_t> local_scores_q(num_local_tokens, 0);
+            int32_t local_max_q = -128;
+            for (int token = 0; token < num_local_tokens; ++token) {
+                int64_t score_q = 0;
+                const int token_base = token * (k_dim * 2);
+                for (int dim = 0; dim < k_dim; ++dim) {
+                    const int q_idx = dim;
+                    const int k_idx = token_base + dim;
+                    if (q_idx < static_cast<int>(t_flit->packet->message.cnoc_qdata.size()) &&
+                        k_idx < static_cast<int>(local_kv_cache_q8.size())) {
+                        score_q += CNoCQuant::mulQ4(
+                            t_flit->packet->message.cnoc_qdata[q_idx],
+                            local_kv_cache_q8[k_idx]);
+                    }
+                }
+                local_scores_q[token] = CNoCQuant::sat8(score_q);
+                local_max_q = std::max(local_max_q, local_scores_q[token]);
+            }
+            // Attention running state is carried by the packet/tail sideband.
+            // In a wormhole/source-routed packet, head flits can reach the next
+            // router before the previous router's tail has updated online
+            // softmax state.  Using the head-created VC state here would model a
+            // stale control dependency that a real in-transit Attention design
+            // would avoid by carrying m/l with the flit stream itself.
+            const int32_t old_max_q = CNoCQuant::quantize(
+                static_cast<float>(t_flit->packet->message.running_max));
+            const int32_t old_sum_q = CNoCQuant::quantize(
+                static_cast<float>(t_flit->packet->message.running_sum));
+            const int32_t new_max_q = std::max(old_max_q, local_max_q);
+            const int32_t old_scale_q = CNoCQuant::expQ4(old_max_q - new_max_q);
+            int32_t local_sum_q = 0;
+            for (int token = 0; token < num_local_tokens; ++token) {
+                local_scores_q[token] = CNoCQuant::expQ4(local_scores_q[token] - new_max_q);
+                local_sum_q = CNoCQuant::sat8(
+                    static_cast<int64_t>(local_sum_q) + local_scores_q[token]);
+            }
+            const int32_t new_sum_q = CNoCQuant::sat8(
+                static_cast<int64_t>(CNoCQuant::mulQ4(old_sum_q, old_scale_q)) +
+                local_sum_q);
+
+            for (int task_idx = 0; task_idx < static_cast<int>(assigned_tasks.size()); ++task_idx) {
+                const int task_id = assigned_tasks[task_idx];
+                const int target_index = t_flit->packet->message.psum_offset + task_id;
+                if (target_index < t_flit->global_data_offset ||
+                    target_index >= t_flit->global_data_offset + payload_size ||
+                    target_index >= static_cast<int>(t_flit->packet->message.cnoc_qdata.size())) {
+                    continue;
+                }
+
+                int32_t old_output_q =
+                    CNoCQuant::mulQ4(t_flit->packet->message.cnoc_qdata[target_index],
+                                     old_scale_q);
+                int32_t local_output_q = 0;
+                for (int token = 0; token < num_local_tokens; ++token) {
+                    const int v_idx = token * (k_dim * 2) + k_dim + task_id;
+                    if (v_idx < static_cast<int>(local_kv_cache_q8.size())) {
+                        local_output_q = CNoCQuant::sat8(
+                            static_cast<int64_t>(local_output_q) +
+                            CNoCQuant::mulQ4(local_scores_q[token], local_kv_cache_q8[v_idx]));
+                    }
+                }
+                writePacketQData(t_flit,
+                                 target_index,
+                                 CNoCQuant::sat8(static_cast<int64_t>(old_output_q) +
+                                                 local_output_q));
+            }
+
+            vc_state.running_max = CNoCQuant::dequantize(new_max_q);
+            vc_state.running_sum = CNoCQuant::dequantize(new_sum_q);
+            t_flit->packet->message.running_max = vc_state.running_max;
+            t_flit->packet->message.running_sum = vc_state.running_sum;
+            break;
+        }
+        default:
+            break;
+    }
+
+    if (t_flit->type == 1 || t_flit->type == 10) {
+        vc_state.reset();
+    }
+#else
+    (void)t_flit;
+    (void)port_idx;
+#endif
+}
+
 void VCRouter::vcRequest(){  
   for(int i=0; i<port_num; i++){ 
       in_port_list[(i+rr_port)%port_num]->vc_request();
@@ -531,6 +944,10 @@ void VCRouter::outPortDequeue(){
 }
 
 void VCRouter::runOneStep(){
+    if (GlobalParams::enable_rtl_router && rtl_router != nullptr) {
+        rtl_router->runOneStep();
+        return;
+    }
     vcRequest();
     getSwitch();
     outPortDequeue();
@@ -556,6 +973,11 @@ void VCRouter::storeWeight(float weight_value) {
         exit(EXIT_FAILURE);
     }
     local_weights.push_back(weight_value);
+}
+
+void VCRouter::storeWeightQuant(int32_t weight_q) {
+    storeWeight(CNoCQuant::dequantize(weight_q));
+    local_weights_q8.push_back(CNoCQuant::sat8(weight_q));
 }
 
 void VCRouter::storeKV(float kv_value) {
@@ -584,18 +1006,37 @@ void VCRouter::writeKV(int index, float kv_value) {
     local_kv_cache[index] = kv_value;
 }
 
+void VCRouter::writeKVQuant(int index, int32_t kv_q) {
+    if (index < 0) {
+        return;
+    }
+    writeKV(index, CNoCQuant::dequantize(kv_q));
+    if (index >= static_cast<int>(local_kv_cache_q8.size())) {
+        local_kv_cache_q8.resize(index + 1, 0);
+    }
+    local_kv_cache_q8[index] = CNoCQuant::sat8(kv_q);
+}
+
 void VCRouter::clearSRAM() {
     local_weights.clear();
     local_kv_cache.clear();
+    local_weights_q8.clear();
+    local_kv_cache_q8.clear();
     current_sram_usage = 0;
     kv_token_count = 0;
-
-    kv_token_count = 0;
     assigned_tasks.clear();
+    if (rtl_router != nullptr) {
+        rtl_router->resetCnocState();
+    }
 }
 
 VCRouter::~VCRouter ()
 {
+  if (rtl_router != nullptr) {
+    delete rtl_router;
+    rtl_router = nullptr;
+  }
+
   RInPort* inPort;
     while(in_port_list.size()!=0){
         inPort = in_port_list.back();
