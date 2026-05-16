@@ -42,8 +42,3 @@ extern "C" int dpi_div(int num_q, int den_q) {
   const float y = CNoCQuant::dequantize(num_q) / CNoCQuant::dequantize(den_q);
   return clamp_i8(CNoCQuant::quantize(y));
 }
-
-extern "C" int dpi_attention_mix(int q_q, int kv_q) {
-  // Functional-only placeholder for attention MAC + normalization behavior.
-  return clamp_i8(CNoCQuant::mulQ4(q_q, kv_q));
-}

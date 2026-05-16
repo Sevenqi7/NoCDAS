@@ -1,131 +1,129 @@
-// Description: Latency-aware functional MFU ALU shell.
-//              Opcode-specific arithmetic is split into leaf modules so each
-//              operation can later be replaced by a dedicated RTL pipeline.
+// Description: Unified MFU ALU wrapper.
+//              The wrapper only decodes the predecoded op struct from
+//              cnoc_mfu, starts the matching leaf/backend, and muxes the
+//              resulting busy/valid/result bundle.
 
 module mfu_alu #(
+    parameter int NUM_PORTS = router_ports_pkg::PORT_NUM,
+    parameter int VC_NUM = router_ports_pkg::VC_NUM,
+    parameter int VC_ID_W = router_ports_pkg::VC_ID_W,
     parameter int FLIT_W = router_ports_pkg::FLIT_W,
-    parameter int LAT_LINEAR = 0,
-    parameter int LAT_MATMUL = 0,
-    parameter int LAT_ADD = 0,
-    parameter int LAT_SWIGLU = 0,
-    parameter int LAT_GEGLU = 0,
-    parameter int LAT_ATTENTION = 8,
-    parameter int LAT_DEFAULT = 0,
-    parameter int LAT_TYPE4_STORE = 0
+    parameter int SRAM_DEPTH = 2048,
+    parameter int SRAM_ADDR_W = router_ports_pkg::CNOC_SRAM_ADDR_W,
+    parameter int DATA_W = router_ports_pkg::CNOC_SRAM_DATA_W,
+    parameter int DATA_ELEM_W = 8,
+    parameter int DATA_ACC_W = 32
 ) (
     input  logic clk_i,
     input  logic reset_i,
-    input  logic start_i,
+    input  router_ports_pkg::mfu_alu_ctrl_t ctrl_i,
+    input  router_ports_pkg::mfu_alu_op_t op_i,
     input  logic [FLIT_W-1:0] flit_i,
     input  router_ports_pkg::flit_meta_t meta_i,
-    input  logic signed [31:0] op_a_i,
-    input  logic signed [31:0] op_b_i,
-    output logic busy_o,
-    output logic result_valid_o,
-    output logic [FLIT_W-1:0] result_flit_o,
-    output router_ports_pkg::flit_meta_t result_meta_o,
-    output logic signed [31:0] result_scalar_o
+    input  router_ports_pkg::mfu_alu_ctx_t ctx_i,
+    input  router_ports_pkg::mfu_alu_data_wr_t data_wr_i,
+    input  router_ports_pkg::mfu_alu_data_rsp_t data_rsp_i,
+    output router_ports_pkg::mfu_alu_data_req_t data_req_o,
+    output router_ports_pkg::mfu_alu_result_t result_o
 );
   import router_ports_pkg::*;
 
-  localparam logic [4:0] OP_LINEAR    = 5'd0;
-  localparam logic [4:0] OP_MATMUL    = 5'd15;
   localparam logic [4:0] OP_ADD       = 5'd18;
   localparam logic [4:0] OP_SWIGLU    = 5'd21;
   localparam logic [4:0] OP_ATTENTION = 5'd23;
   localparam logic [4:0] OP_GEGLU     = 5'd24;
 
-  logic active_q;
-  logic [15:0] wait_cnt_q;
-  logic [FLIT_W-1:0] result_flit_q;
-  flit_meta_t result_meta_q;
-  logic signed [31:0] result_scalar_q;
-  logic result_valid_q;
+  logic signed [31:0] scalar_a;
+  logic signed [31:0] scalar_b;
 
-  logic [4:0] opcode;
-  logic [2:0] msg_type;
-  logic [15:0] selected_latency;
+  logic add_start;
+  logic swiglu_start;
+  logic geglu_start;
+  logic default_start;
+  logic attention_start;
 
-  logic [FLIT_W-1:0] type4_flit;
-  flit_meta_t type4_meta;
-  logic signed [31:0] type4_scalar;
-  logic [FLIT_W-1:0] linear_flit;
-  flit_meta_t linear_meta;
-  logic signed [31:0] linear_scalar;
-  logic [FLIT_W-1:0] matmul_flit;
-  flit_meta_t matmul_meta;
-  logic signed [31:0] matmul_scalar;
+  logic add_busy;
+  logic add_valid;
   logic [FLIT_W-1:0] add_flit;
   flit_meta_t add_meta;
   logic signed [31:0] add_scalar;
+
+  logic swiglu_busy;
+  logic swiglu_valid;
   logic [FLIT_W-1:0] swiglu_flit;
   flit_meta_t swiglu_meta;
   logic signed [31:0] swiglu_scalar;
+
+  logic geglu_busy;
+  logic geglu_valid;
   logic [FLIT_W-1:0] geglu_flit;
   flit_meta_t geglu_meta;
   logic signed [31:0] geglu_scalar;
-  logic [FLIT_W-1:0] attention_flit;
-  flit_meta_t attention_meta;
-  logic signed [31:0] attention_scalar;
+
+  logic default_busy;
+  logic default_valid;
   logic [FLIT_W-1:0] default_flit;
   flit_meta_t default_meta;
   logic signed [31:0] default_scalar;
 
-  logic [FLIT_W-1:0] selected_flit;
-  flit_meta_t selected_meta;
-  logic signed [31:0] selected_scalar;
+  logic matmul_busy;
+  logic matmul_valid;
+  logic [FLIT_W-1:0] matmul_flit;
+  flit_meta_t matmul_meta;
+  logic signed [31:0] matmul_scalar;
 
-  assign opcode = meta_i.opcode;
-  assign msg_type = meta_i.msg_type;
+  logic attention_busy;
+  logic attention_valid;
+  logic attention_active;
+  logic [FLIT_W-1:0] attention_flit;
+  flit_meta_t attention_meta;
 
-  always_comb begin : proc_selected_latency
-    selected_latency = 16'(LAT_DEFAULT);
-    if (msg_type == ROUTER_MSG_DIST) begin
-      selected_latency = 16'(LAT_TYPE4_STORE);
-    end else begin
-      unique case (opcode)
-        OP_LINEAR:    selected_latency = 16'(LAT_LINEAR);
-        OP_MATMUL:    selected_latency = 16'(LAT_MATMUL);
-        OP_ADD:       selected_latency = 16'(LAT_ADD);
-        OP_SWIGLU:    selected_latency = 16'(LAT_SWIGLU);
-        OP_GEGLU:     selected_latency = 16'(LAT_GEGLU);
-        OP_ATTENTION: selected_latency = 16'(LAT_ATTENTION);
-        default:      selected_latency = 16'(LAT_DEFAULT);
-      endcase
-    end
-  end
+  logic [FLIT_W-1:0] result_flit_comb;
+  flit_meta_t result_meta_comb;
+  logic signed [31:0] result_scalar_comb;
+  logic result_valid_comb;
+  logic result_busy_comb;
 
-  mfu_alu_type4_store #(
-      .FLIT_W(FLIT_W)
-  ) type4_store_i (
-      .flit_i(flit_i),
-      .meta_i(meta_i),
-      .op_a_i(op_a_i),
-      .op_b_i(op_b_i),
-      .result_flit_o(type4_flit),
-      .result_meta_o(type4_meta),
-      .result_scalar_o(type4_scalar)
-  );
+  assign scalar_a = {{24{flit_i[{meta_i.data_offset[4:0], 3'b000} + 7]}},
+                     flit_i[{meta_i.data_offset[4:0], 3'b000} +: 8]};
+  assign scalar_b = {{24{data_rsp_i.rdata[7]}}, data_rsp_i.rdata[7:0]};
 
-  mfu_alu_linear #(
-      .FLIT_W(FLIT_W)
-  ) linear_i (
-      .flit_i(flit_i),
-      .meta_i(meta_i),
-      .op_a_i(op_a_i),
-      .op_b_i(op_b_i),
-      .result_flit_o(linear_flit),
-      .result_meta_o(linear_meta),
-      .result_scalar_o(linear_scalar)
-  );
+  assign add_start = ctrl_i.start && !op_i.is_data_op && !op_i.is_attention &&
+                     (op_i.opcode == OP_ADD);
+  assign swiglu_start = ctrl_i.start && !op_i.is_data_op && !op_i.is_attention &&
+                        (op_i.opcode == OP_SWIGLU);
+  assign geglu_start = ctrl_i.start && !op_i.is_data_op && !op_i.is_attention &&
+                       (op_i.opcode == OP_GEGLU);
+  assign default_start = ctrl_i.start && !op_i.is_data_op && !op_i.is_attention &&
+                         (op_i.opcode != OP_ADD) &&
+                         (op_i.opcode != OP_SWIGLU) &&
+                         (op_i.opcode != OP_GEGLU);
+  assign attention_start = ctrl_i.start && op_i.is_attention;
 
   mfu_alu_matmul #(
-      .FLIT_W(FLIT_W)
+      .NUM_PORTS(NUM_PORTS),
+      .VC_NUM(VC_NUM),
+      .VC_ID_W(VC_ID_W),
+      .FLIT_W(FLIT_W),
+      .SRAM_DEPTH(SRAM_DEPTH),
+      .SRAM_ADDR_W(SRAM_ADDR_W),
+      .DATA_W(DATA_W),
+      .DATA_ELEM_W(DATA_ELEM_W),
+      .ACC_W(DATA_ACC_W)
   ) matmul_i (
-      .flit_i(flit_i),
-      .meta_i(meta_i),
-      .op_a_i(op_a_i),
-      .op_b_i(op_b_i),
+      .clk_i(clk_i),
+      .reset_i(reset_i),
+      .fetch_en_i(ctrl_i.fetch_en),
+      .compute_en_i(ctrl_i.compute_en),
+      .release_state_i(ctrl_i.state_release),
+      .op_i(op_i),
+      .pkt_flit_i(flit_i),
+      .pkt_meta_i(meta_i),
+      .ctx_i(ctx_i),
+      .data_rsp_i(data_rsp_i),
+      .data_req_o(data_req_o),
+      .busy_o(matmul_busy),
+      .result_valid_o(matmul_valid),
       .result_flit_o(matmul_flit),
       .result_meta_o(matmul_meta),
       .result_scalar_o(matmul_scalar)
@@ -134,10 +132,15 @@ module mfu_alu #(
   mfu_alu_add #(
       .FLIT_W(FLIT_W)
   ) add_i (
+      .clk_i(clk_i),
+      .reset_i(reset_i),
+      .start_i(add_start),
       .flit_i(flit_i),
       .meta_i(meta_i),
-      .op_a_i(op_a_i),
-      .op_b_i(op_b_i),
+      .scalar_a_i(scalar_a),
+      .scalar_b_i(scalar_b),
+      .busy_o(add_busy),
+      .valid_o(add_valid),
       .result_flit_o(add_flit),
       .result_meta_o(add_meta),
       .result_scalar_o(add_scalar)
@@ -146,10 +149,15 @@ module mfu_alu #(
   mfu_alu_swiglu #(
       .FLIT_W(FLIT_W)
   ) swiglu_i (
+      .clk_i(clk_i),
+      .reset_i(reset_i),
+      .start_i(swiglu_start),
       .flit_i(flit_i),
       .meta_i(meta_i),
-      .op_a_i(op_a_i),
-      .op_b_i(op_b_i),
+      .scalar_a_i(scalar_a),
+      .scalar_b_i(scalar_b),
+      .busy_o(swiglu_busy),
+      .valid_o(swiglu_valid),
       .result_flit_o(swiglu_flit),
       .result_meta_o(swiglu_meta),
       .result_scalar_o(swiglu_scalar)
@@ -158,124 +166,116 @@ module mfu_alu #(
   mfu_alu_geglu #(
       .FLIT_W(FLIT_W)
   ) geglu_i (
+      .clk_i(clk_i),
+      .reset_i(reset_i),
+      .start_i(geglu_start),
       .flit_i(flit_i),
       .meta_i(meta_i),
-      .op_a_i(op_a_i),
-      .op_b_i(op_b_i),
+      .scalar_a_i(scalar_a),
+      .scalar_b_i(scalar_b),
+      .busy_o(geglu_busy),
+      .valid_o(geglu_valid),
       .result_flit_o(geglu_flit),
       .result_meta_o(geglu_meta),
       .result_scalar_o(geglu_scalar)
   );
 
   mfu_alu_attention #(
-      .FLIT_W(FLIT_W)
+      .NUM_PORTS(NUM_PORTS),
+      .VC_NUM(VC_NUM),
+      .VC_ID_W(VC_ID_W),
+      .FLIT_W(FLIT_W),
+      .SRAM_DEPTH(SRAM_DEPTH),
+      .SRAM_ADDR_W(SRAM_ADDR_W)
   ) attention_i (
-      .flit_i(flit_i),
-      .meta_i(meta_i),
-      .op_a_i(op_a_i),
-      .op_b_i(op_b_i),
-      .result_flit_o(attention_flit),
-      .result_meta_o(attention_meta),
-      .result_scalar_o(attention_scalar)
+      .clk(clk_i),
+      .reset(reset_i),
+      .op_i(op_i),
+      .data_wr_i(data_wr_i),
+      .ctx_i(ctx_i),
+      .start_i(attention_start),
+      .release_state_i(ctrl_i.state_release),
+      .pkt_flit_i(flit_i),
+      .pkt_meta_i(meta_i),
+      .busy_o(attention_busy),
+      .valid_o(attention_valid),
+      .attention_active_o(attention_active),
+      .attention_flit_o(attention_flit),
+      .attention_meta_o(attention_meta)
   );
 
   mfu_alu_default #(
       .FLIT_W(FLIT_W)
   ) default_i (
+      .clk_i(clk_i),
+      .reset_i(reset_i),
+      .start_i(default_start),
       .flit_i(flit_i),
       .meta_i(meta_i),
-      .op_a_i(op_a_i),
-      .op_b_i(op_b_i),
+      .scalar_a_i(scalar_a),
+      .scalar_b_i(scalar_b),
+      .busy_o(default_busy),
+      .valid_o(default_valid),
       .result_flit_o(default_flit),
       .result_meta_o(default_meta),
       .result_scalar_o(default_scalar)
   );
 
-  always_comb begin : proc_selected_result
-    selected_flit = type4_flit;
-    selected_meta = type4_meta;
-    selected_scalar = type4_scalar;
+  always_comb begin : proc_result_mux
+    result_flit_comb = '0;
+    result_meta_comb = '0;
+    result_scalar_comb = 32'sd0;
+    result_valid_comb = 1'b0;
+    result_busy_comb = matmul_busy || attention_busy || add_busy ||
+                       swiglu_busy || geglu_busy || default_busy;
 
-    if (msg_type != ROUTER_MSG_DIST) begin
-      unique case (opcode)
-        OP_LINEAR: begin
-          selected_flit = linear_flit;
-          selected_meta = linear_meta;
-          selected_scalar = linear_scalar;
-        end
-        OP_MATMUL: begin
-          selected_flit = matmul_flit;
-          selected_meta = matmul_meta;
-          selected_scalar = matmul_scalar;
-        end
+    if (op_i.is_data_op) begin
+      result_flit_comb = matmul_flit;
+      result_meta_comb = matmul_meta;
+      result_scalar_comb = matmul_scalar;
+      result_valid_comb = matmul_valid;
+    end else if (op_i.is_attention) begin
+      result_flit_comb = attention_flit;
+      result_meta_comb = attention_meta;
+      result_scalar_comb = 32'sd0;
+      result_valid_comb = attention_valid;
+    end else begin
+      unique case (op_i.opcode)
         OP_ADD: begin
-          selected_flit = add_flit;
-          selected_meta = add_meta;
-          selected_scalar = add_scalar;
+          result_flit_comb = add_flit;
+          result_meta_comb = add_meta;
+          result_scalar_comb = add_scalar;
+          result_valid_comb = add_valid;
         end
         OP_SWIGLU: begin
-          selected_flit = swiglu_flit;
-          selected_meta = swiglu_meta;
-          selected_scalar = swiglu_scalar;
+          result_flit_comb = swiglu_flit;
+          result_meta_comb = swiglu_meta;
+          result_scalar_comb = swiglu_scalar;
+          result_valid_comb = swiglu_valid;
         end
         OP_GEGLU: begin
-          selected_flit = geglu_flit;
-          selected_meta = geglu_meta;
-          selected_scalar = geglu_scalar;
-        end
-        OP_ATTENTION: begin
-          selected_flit = attention_flit;
-          selected_meta = attention_meta;
-          selected_scalar = attention_scalar;
+          result_flit_comb = geglu_flit;
+          result_meta_comb = geglu_meta;
+          result_scalar_comb = geglu_scalar;
+          result_valid_comb = geglu_valid;
         end
         default: begin
-          selected_flit = default_flit;
-          selected_meta = default_meta;
-          selected_scalar = default_scalar;
+          result_flit_comb = default_flit;
+          result_meta_comb = default_meta;
+          result_scalar_comb = default_scalar;
+          result_valid_comb = default_valid;
         end
       endcase
     end
   end
 
-  always_ff @(posedge clk_i) begin
-    if (reset_i) begin
-      active_q <= 1'b0;
-      wait_cnt_q <= 16'd0;
-      result_flit_q <= '0;
-      result_meta_q <= '0;
-      result_scalar_q <= 32'sd0;
-      result_valid_q <= 1'b0;
-    end else begin
-      result_valid_q <= 1'b0;
-
-      if (start_i && !active_q) begin
-        result_flit_q <= selected_flit;
-        result_meta_q <= selected_meta;
-        result_scalar_q <= selected_scalar;
-        if (selected_latency == 16'd0) begin
-          active_q <= 1'b0;
-          wait_cnt_q <= 16'd0;
-          result_valid_q <= 1'b1;
-        end else begin
-          active_q <= 1'b1;
-          wait_cnt_q <= selected_latency;
-        end
-      end else if (active_q) begin
-        if (wait_cnt_q <= 16'd1) begin
-          active_q <= 1'b0;
-          wait_cnt_q <= 16'd0;
-          result_valid_q <= 1'b1;
-        end else begin
-          wait_cnt_q <= wait_cnt_q - 16'd1;
-        end
-      end
-    end
-  end
-
-  assign busy_o = active_q;
-  assign result_valid_o = result_valid_q;
-  assign result_flit_o = result_flit_q;
-  assign result_meta_o = result_meta_q;
-  assign result_scalar_o = result_scalar_q;
+  assign result_o.busy = result_busy_comb;
+  assign result_o.valid = result_valid_comb;
+  assign result_o.flit = result_flit_comb;
+  assign result_o.meta = result_meta_comb;
+  assign result_o.scalar = result_scalar_comb;
+  assign result_o.attention_active = attention_active;
+  assign result_o.attention_flit = attention_flit;
+  assign result_o.attention_meta = attention_meta;
 
 endmodule

@@ -1,9 +1,9 @@
 // Copyright (c) 2026
 //
 // Description: MFU writeback formatting.
-//              Chooses between the latency-aware ALU payload, the MatMul psum
-//              payload, or the original type4 passthrough payload.  All arithmetic
-//              is completed before this module observes the data.
+//              Chooses between the latency-aware ALU payload, the Attention
+//              payload, or the original type4 passthrough payload.  All
+//              arithmetic is completed before this module observes the data.
 
 module mfu_writeback #(
     parameter int FLIT_W = router_ports_pkg::FLIT_W
@@ -13,8 +13,6 @@ module mfu_writeback #(
     input  logic             pkt_is_type5_i,
     input  logic [FLIT_W-1:0] alu_flit_i,
     input  router_ports_pkg::flit_meta_t alu_meta_i,
-    input  logic             matmul_active_i,
-    input  logic [FLIT_W-1:0] matmul_flit_i,
     input  logic             attention_active_i,
     input  logic [FLIT_W-1:0] attention_flit_i,
     input  router_ports_pkg::flit_meta_t attention_meta_i,
@@ -62,13 +60,10 @@ module mfu_writeback #(
         end
         OP_LINEAR,
         OP_MATMUL: begin
-          // MatMul/Linear update psum slots when their psum flit passes the
-          // MFU.  The per-task accumulation state is owned by mfu_matmul.
-          // If this flit carries a psum lane owned by the router, mfu_matmul
-          // returns an edited payload; otherwise this branch forwards unchanged.
-          if (matmul_active_i) begin
-            emit_flit_o = matmul_flit_i;
-          end
+          // MatMul/Linear are now ALU-owned multi-cycle operations.  The ALU
+          // result already includes any psum overlay for this flit.
+          emit_flit_o = alu_flit_i;
+          emit_meta_o = alu_meta_i;
 `ifdef ROUTER_ENABLE_COSIM
           emit_meta_o.cosim.data_q = emit_flit_o[{data_lane, 3'b000} +: 8];
 `endif

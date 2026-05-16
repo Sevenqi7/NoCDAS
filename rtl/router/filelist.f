@@ -6,8 +6,6 @@ rtl/router/core/mfu_ctrl_fsm.v
 rtl/router/core/mfu_sram.v
 rtl/router/core/mfu_sram_if.sv
 rtl/router/core/mfu_writeback.sv
-rtl/router/alu/mfu_alu_type4_store.sv
-rtl/router/alu/mfu_alu_linear.sv
 rtl/router/alu/mfu_alu_matmul.sv
 rtl/router/alu/mfu_alu_add.sv
 rtl/router/alu/mfu_alu_swiglu.sv
@@ -15,8 +13,6 @@ rtl/router/alu/mfu_alu_geglu.sv
 rtl/router/alu/mfu_alu_attention.sv
 rtl/router/alu/mfu_alu_default.sv
 rtl/router/core/mfu_alu.sv
-rtl/router/core/mfu_matmul.sv
-rtl/router/core/mfu_attention.sv
 rtl/router/core/mfu_arbiter.sv
 rtl/router/core/cnoc_mfu.sv
 rtl/router/core/xy_route_compute.sv

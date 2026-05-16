@@ -6,10 +6,15 @@
 module mfu_alu_swiglu #(
     parameter int FLIT_W = router_ports_pkg::FLIT_W
 ) (
+    input  logic clk_i,
+    input  logic reset_i,
+    input  logic start_i,
     input  logic [FLIT_W-1:0] flit_i,
     input  router_ports_pkg::flit_meta_t meta_i,
-    input  logic signed [31:0] op_a_i,
-    input  logic signed [31:0] op_b_i,
+    input  logic signed [31:0] scalar_a_i,
+    input  logic signed [31:0] scalar_b_i,
+    output logic busy_o,
+    output logic valid_o,
     output logic [FLIT_W-1:0] result_flit_o,
     output router_ports_pkg::flit_meta_t result_meta_o,
     output logic signed [31:0] result_scalar_o
@@ -31,6 +36,9 @@ module mfu_alu_swiglu #(
   logic [5:0] payload_len;
   logic [5:0] effective_payload_len;
   logic [15:0] pair_update_mask;
+  logic [FLIT_W-1:0] result_flit;
+  flit_meta_t result_meta;
+  logic signed [31:0] result_scalar;
 
   assign data_lane = meta_i.data_offset[4:0];
   assign payload_len = meta_i.payload_len;
@@ -39,8 +47,9 @@ module mfu_alu_swiglu #(
       (payload_len == 6'd0) ? 6'd1 :
       (payload_len > 6'd32) ? 6'd32 :
                               payload_len;
+  assign busy_o = 1'b0;
 
-  always_comb begin
+  always_comb begin : proc_swiglu_result
     flit_tmp = flit_i;
     meta_tmp = meta_i;
     lhs_q = 32'sd0;
@@ -70,14 +79,30 @@ module mfu_alu_swiglu #(
 
     scalar_byte_tmp = flit_tmp[{data_lane, 3'b000} +: 8];
     scalar_tmp = {{24{scalar_byte_tmp[7]}}, scalar_byte_tmp} +
-                 ((op_a_i ^ op_b_i) & 32'sd0);
-    result_flit_o = flit_tmp;
-    result_meta_o = meta_tmp;
-    result_scalar_o = scalar_tmp;
+                      ((scalar_a_i ^ scalar_b_i) & 32'sd0);
+    result_flit = flit_tmp;
+    result_meta = meta_tmp;
+    result_scalar = scalar_tmp;
 
 `ifdef ROUTER_ENABLE_COSIM
-    result_meta_o.cosim.data_q = result_flit_o[{data_lane, 3'b000} +: 8];
+    result_meta.cosim.data_q = result_flit[{data_lane, 3'b000} +: 8];
 `endif
+  end
+
+  always_ff @(posedge clk_i) begin : proc_swiglu_registers
+    if (reset_i) begin
+      valid_o <= 1'b0;
+      result_flit_o <= '0;
+      result_meta_o <= '0;
+      result_scalar_o <= 32'sd0;
+    end else begin
+      valid_o <= start_i;
+      if (start_i) begin
+        result_flit_o <= result_flit;
+        result_meta_o <= result_meta;
+        result_scalar_o <= result_scalar;
+      end
+    end
   end
 
 endmodule

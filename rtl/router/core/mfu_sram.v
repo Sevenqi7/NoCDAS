@@ -3,7 +3,7 @@
 //              by the functional cNoC datapath.
 
 module mfu_sram #(
-    parameter integer DATA_W = 8,
+    parameter integer DATA_W = 64,
     parameter integer DEPTH = 2048,
     parameter integer ADDR_W = 11
 )(
@@ -18,19 +18,24 @@ module mfu_sram #(
     input [ADDR_W-1:0] rd_addr,
     output [DATA_W-1:0] rd_data
 );
-  reg [DATA_W-1:0] weight_bank [0:DEPTH-1];
-  reg [DATA_W-1:0] kv_bank     [0:DEPTH-1];
+  localparam integer DATA_BYTES = DATA_W / 8;
+
+  reg [7:0] weight_bank [0:DEPTH-1];
+  reg [7:0] kv_bank     [0:DEPTH-1];
+  reg [DATA_W-1:0] rd_data_comb;
 
   integer i;
   integer lane;
   integer lane_addr;
+  integer read_byte;
+  integer read_addr;
   always @(posedge clk) begin
     // Reset clears both banks to make unit tests and trace regressions
     // deterministic.
     if (reset) begin
       for (i = 0; i < DEPTH; i = i + 1) begin
-        weight_bank[i] <= {DATA_W{1'b0}};
-        kv_bank[i] <= {DATA_W{1'b0}};
+        weight_bank[i] <= 8'd0;
+        kv_bank[i] <= 8'd0;
       end
     // Type4 storage writes one or more byte lanes into the selected bank.
     end else if (wr_en) begin
@@ -50,5 +55,16 @@ module mfu_sram #(
     end
   end
 
-  assign rd_data = rd_bank_sel ? kv_bank[rd_addr] : weight_bank[rd_addr];
+  always @* begin
+    rd_data_comb = {DATA_W{1'b0}};
+    for (read_byte = 0; read_byte < DATA_BYTES; read_byte = read_byte + 1) begin
+      read_addr = rd_addr + read_byte;
+      if (read_addr < DEPTH) begin
+        rd_data_comb[read_byte*8 +: 8] =
+            rd_bank_sel ? kv_bank[read_addr] : weight_bank[read_addr];
+      end
+    end
+  end
+
+  assign rd_data = rd_data_comb;
 endmodule

@@ -8,14 +8,7 @@ module cnoc_mfu #(
     parameter int VC_NUM = 8,
     parameter int VC_ID_W = 3,
     parameter int FLIT_W = 256,
-    parameter int MFU_LAT_LINEAR = 0,
-    parameter int MFU_LAT_MATMUL = 0,
-    parameter int MFU_LAT_ADD = 0,
-    parameter int MFU_LAT_SWIGLU = 0,
-    parameter int MFU_LAT_GEGLU = 0,
-    parameter int MFU_LAT_ATTENTION = 8,
-    parameter int MFU_LAT_DEFAULT = 0,
-    parameter int MFU_LAT_TYPE4_STORE = 0
+    parameter int MFU_MATMUL_ACC_W = 32
 ) (
     input  logic clk,
     input  logic reset,
@@ -42,8 +35,10 @@ module cnoc_mfu #(
     output logic [FLIT_W-1:0] emit_flit_o,
     output router_ports_pkg::flit_meta_t emit_meta_o,
     output router_ports_pkg::route_path_t emit_route_path_o,
-    output logic [VC_ID_W-1:0] emit_vc_id_o,
+    output logic [VC_ID_W-1:0] emit_vc_id_o
 
+`ifdef ROUTER_ENABLE_COSIM
+    ,
     output logic [31:0] weight_bytes_stored_o,
     output logic [31:0] kv_bytes_stored_o,
     output logic [15:0] kv_token_count_o,
@@ -51,15 +46,20 @@ module cnoc_mfu #(
     output logic        last_type4_store_bank_o,
     output logic [10:0] last_type4_store_addr_o,
     output logic [5:0]  last_type4_store_bytes_o
+`endif
 );
   import router_ports_pkg::*;
 
+  localparam logic [4:0] OPCODE_LINEAR = 5'd0;
+  localparam logic [4:0] OPCODE_MATMUL = 5'd15;
   localparam logic [4:0] OPCODE_ATTENTION = 5'd23;
   localparam int SRAM_DEPTH = 2048;
   localparam logic [31:0] SRAM_DEPTH_U32 = 32'd2048;
   localparam int SRAM_ADDR_W = 11;
-  localparam int SINK_TOKENS = 4;
-  localparam logic [15:0] SINK_TOKENS_Q = 16'd4;
+  localparam int ALU_DATA_W = 64;
+  localparam int ALU_DATA_ELEM_W = 8;
+  localparam int TYPE4_KV_SINK_TOKENS = 4;
+  localparam logic [15:0] TYPE4_KV_SINK_TOKENS_Q = 16'd4;
 
   // Single-entry cNoC packet register.  The MFU owns one flit until ALU/MFU
   // work finishes and the original output port has downstream credit.
@@ -83,8 +83,6 @@ module cnoc_mfu #(
   logic decoded_is_type4_q;
   logic decoded_is_type5_q;
   logic decoded_tail_like_q;
-  logic [4:0] decoded_data_lane;
-  logic signed [7:0] decoded_payload_lane;
 
   logic fsm_busy;
   logic decode_en;
@@ -92,15 +90,12 @@ module cnoc_mfu #(
   logic compute_en;
   logic write_back_en;
   logic compute_done;
-  logic compute_fire;
-  logic alu_start;
-  logic alu_busy;
-  logic alu_result_valid;
   logic emit_ready;
+  logic decoded_is_data_op;
 
   // Type4 distribution path: payload bytes are written into either the weight
   // SRAM bank or the Attention KV bank.
-  logic [7:0] sram_rdata;
+  logic [ALU_DATA_W-1:0] sram_rdata;
   logic sram_wr_en;
   logic sram_wr_bank_sel;
   logic [SRAM_ADDR_W-1:0] sram_wr_addr;
@@ -108,39 +103,37 @@ module cnoc_mfu #(
   logic [255:0] sram_wr_data;
   logic sram_rd_bank_sel;
   logic [SRAM_ADDR_W-1:0] sram_rd_addr;
-  logic [SRAM_ADDR_W-1:0] storage_wr_addr;
-  logic [15:0] kv_token_count_q;
-  logic [15:0] kv_token_stride;
-  logic [15:0] kv_max_tokens_raw;
-  logic [15:0] kv_max_tokens_safe;
-  logic [15:0] kv_sink_limit;
-  logic [31:0] kv_max_tokens_full;
-  logic [15:0] kv_ring_span;
-  logic [15:0] kv_slot;
-  logic [31:0] storage_wr_addr_full;
-  logic [5:0] effective_payload_bytes;
-  logic [31:0] bytes_to_sram_end_full;
-  logic [5:0] bytes_to_sram_end;
+  logic type4_bank_sel;
+  logic [SRAM_ADDR_W-1:0] type4_wr_addr;
+  logic [15:0] type4_kv_token_count_q;
+  logic [15:0] type4_kv_stride;
+  logic [15:0] type4_kv_max_tokens_raw;
+  logic [15:0] type4_kv_max_tokens_safe;
+  logic [15:0] type4_kv_sink_limit;
+  logic [31:0] type4_kv_max_tokens_full;
+  logic [15:0] type4_kv_ring_span;
+  logic [15:0] type4_kv_slot;
+  logic [31:0] type4_wr_addr_full;
+  logic [5:0] type4_payload_bytes;
+  logic [31:0] type4_bytes_to_sram_end_full;
+  logic [5:0] type4_bytes_to_sram_end;
   logic [5:0] type4_store_bytes;
-  logic matmul_weight_wr_en;
-  logic attention_kv_wr_en;
 
   // Type5 compute/writeback path.  ALU results are latched so writeback only
   // observes a result after the latency-aware ALU has asserted result_valid.
-  logic signed [31:0] fetch_operand_a_q;
-  logic signed [31:0] fetch_operand_b_q;
-  logic [FLIT_W-1:0] alu_result_flit;
-  flit_meta_t alu_result_meta;
-  logic [FLIT_W-1:0] processed_flit_q;
-  flit_meta_t processed_meta_q;
   logic [FLIT_W-1:0] writeback_flit;
-  logic [FLIT_W-1:0] matmul_writeback_flit;
-  logic [FLIT_W-1:0] attention_writeback_flit;
-  flit_meta_t attention_writeback_meta;
-  logic matmul_active;
-  logic attention_active;
   logic type5_tail_emit;
+  logic mfu_sram_if_rd_bank_sel;
+  logic [SRAM_ADDR_W-1:0] mfu_sram_if_rd_addr;
+  mfu_alu_ctrl_t alu_ctrl;
+  mfu_alu_ctx_t alu_ctx;
+  mfu_alu_data_wr_t alu_data_wr;
+  mfu_alu_data_rsp_t alu_data_rsp;
+  mfu_alu_data_req_t alu_data_req;
+  mfu_alu_op_t alu_op;
+  mfu_alu_result_t alu_result;
 
+`ifdef ROUTER_ENABLE_COSIM
   // Status bridge for NoCDAS phase gating and trace diagnostics.  These are not
   // used to make RTL routing/storage/compute decisions.
   logic [31:0] weight_bytes_stored_q;
@@ -149,15 +142,14 @@ module cnoc_mfu #(
   logic last_type4_store_bank_q;
   logic [SRAM_ADDR_W-1:0] last_type4_store_addr_q;
   logic [5:0] last_type4_store_bytes_q;
+`endif
 
   // Capture/control path.  Non-cNoC traffic is intentionally invisible here and
   // remains on Router.sv's regular datapath.
   assign capture_o = raw_valid_i && !pkt_valid_q && !fsm_busy;
   assign capture_out_sel_o = raw_out_sel_i;
-  assign busy_o = pkt_valid_q || fsm_busy || alu_busy;
-  assign alu_start = pkt_valid_q && compute_en && !alu_busy && !alu_result_valid;
-  assign compute_done = alu_result_valid;
-  assign compute_fire = alu_result_valid;
+  assign busy_o = pkt_valid_q || fsm_busy || alu_result.busy;
+  assign compute_done = decoded_is_type4_q ? 1'b1 : alu_result.valid;
   assign emit_ready =
       routport_flow_i[pkt_out_sel_q].state_ready &&
       routport_flow_i[pkt_out_sel_q].downstream_vc_credit_mask[pkt_vc_q];
@@ -167,81 +159,112 @@ module cnoc_mfu #(
   assign emit_route_path_o = pkt_route_path_q;
   assign emit_vc_id_o = pkt_vc_q;
 
-  // Type4 storage/KV address generation.
-  assign kv_token_stride = (decoded_k_dim_q == 16'd0) ? 16'd1 : (decoded_k_dim_q << 1);
-  assign kv_max_tokens_full = (kv_token_stride == 16'd0) ? 32'd1 : (SRAM_DEPTH / kv_token_stride);
-  assign kv_max_tokens_raw =
-      // Degenerate k_dim/storage cases still expose at least one safe logical
-      // token slot through kv_max_tokens_safe below.
-      (kv_max_tokens_full == 32'd0) ? 16'd0 :
-      // Clamp large capacities into the 16-bit token-count domain.
-      (kv_max_tokens_full > 32'h0000_ffff) ? 16'hffff :
-      // Normal case: SRAM depth divided by K/V token stride.
-                                             kv_max_tokens_full[15:0];
-  assign kv_max_tokens_safe = (kv_max_tokens_raw == 16'd0) ? 16'd1 : kv_max_tokens_raw;
-  assign kv_sink_limit =
-      // Preserve up to SINK_TOKENS initial tokens, but never more than the local
-      // SRAM can hold.
-      (kv_max_tokens_safe > SINK_TOKENS_Q) ? SINK_TOKENS_Q : kv_max_tokens_safe;
-  assign kv_ring_span =
-      // If there is space after sink tokens, later tokens rotate through that
-      // ring.  Otherwise all rolling writes collapse to the final safe slot.
-      (kv_max_tokens_safe > kv_sink_limit) ? (kv_max_tokens_safe - kv_sink_limit) : 16'd1;
-  assign kv_slot =
-      // Initial prefill tokens are pinned as sink tokens.
-      (kv_token_count_q < kv_sink_limit) ?
-      kv_token_count_q :
-      // Later tokens use ring-buffer replacement after the sink region.
-      (kv_max_tokens_safe > kv_sink_limit) ?
-      (kv_sink_limit + ((kv_token_count_q - kv_sink_limit) % kv_ring_span)) :
-      // Fully degenerate case: one usable token slot remains.
-      (kv_max_tokens_safe - 16'd1);
-  assign storage_wr_addr_full =
-      // Attention type4 packets load KV-cache slots.  The address is token slot
-      // base plus the flit's data offset within K/V.
-      (decoded_opcode_q == OPCODE_ATTENTION) ?
-      ((kv_slot * kv_token_stride) + decoded_data_idx_q) :
-      // Non-Attention type4 packets load the linear/MatMul weight bank directly
-      // at data_offset.
-      decoded_data_idx_q;
-  assign storage_wr_addr = storage_wr_addr_full[SRAM_ADDR_W-1:0];
-  assign effective_payload_bytes =
-      // Padding-only flits carry no SRAM/KV bytes.  Tail flits may still mark a
-      // logical token complete, but they must not overwrite address 0 through
-      // an implied scalar payload lane.
-      (decoded_payload_len_q == 6'd0) ? 6'd0 :
-      // A 256-bit flit can carry at most 32 INT8 lanes.
-      (decoded_payload_len_q > 6'd32) ? 6'd32 :
-                                        decoded_payload_len_q;
-  assign bytes_to_sram_end_full =
-      // Fully out-of-range writes become no-ops rather than wrapping in SRAM.
-      (storage_wr_addr_full >= SRAM_DEPTH) ? 32'd0 :
-      // Otherwise limit the write to the remaining bytes in the local bank.
-                                             (SRAM_DEPTH_U32 - storage_wr_addr_full);
-  assign bytes_to_sram_end =
-      (bytes_to_sram_end_full > 32'd32) ? 6'd32 :
-                                          bytes_to_sram_end_full[5:0];
-  assign type4_store_bytes =
-      // Write no more than both the valid payload bytes and the remaining SRAM
-      // capacity.
-      (effective_payload_bytes < bytes_to_sram_end) ? effective_payload_bytes :
-                                                      bytes_to_sram_end;
-  assign matmul_weight_wr_en = sram_wr_en && !sram_wr_bank_sel;
-  assign attention_kv_wr_en = sram_wr_en && sram_wr_bank_sel;
+  always_comb begin : proc_type4_storage
+    type4_bank_sel = (decoded_opcode_q == OPCODE_ATTENTION);
+    type4_kv_stride = (decoded_k_dim_q == 16'd0) ? 16'd1 : (decoded_k_dim_q << 1);
+    type4_kv_max_tokens_full =
+        (type4_kv_stride == 16'd0) ? 32'd1 : (SRAM_DEPTH / type4_kv_stride);
+    type4_kv_max_tokens_raw =
+        (type4_kv_max_tokens_full == 32'd0) ? 16'd0 :
+        (type4_kv_max_tokens_full > 32'h0000_ffff) ? 16'hffff :
+                                                     type4_kv_max_tokens_full[15:0];
+    type4_kv_max_tokens_safe =
+        (type4_kv_max_tokens_raw == 16'd0) ? 16'd1 : type4_kv_max_tokens_raw;
+    type4_kv_sink_limit =
+        (type4_kv_max_tokens_safe > TYPE4_KV_SINK_TOKENS_Q) ?
+        TYPE4_KV_SINK_TOKENS_Q :
+        type4_kv_max_tokens_safe;
+    type4_kv_ring_span =
+        (type4_kv_max_tokens_safe > type4_kv_sink_limit) ?
+        (type4_kv_max_tokens_safe - type4_kv_sink_limit) :
+        16'd1;
+
+    if (type4_kv_token_count_q < type4_kv_sink_limit) begin
+      type4_kv_slot = type4_kv_token_count_q;
+    end else if (type4_kv_max_tokens_safe > type4_kv_sink_limit) begin
+      type4_kv_slot =
+          type4_kv_sink_limit +
+          ((type4_kv_token_count_q - type4_kv_sink_limit) % type4_kv_ring_span);
+    end else begin
+      type4_kv_slot = type4_kv_max_tokens_safe - 16'd1;
+    end
+
+    if (type4_bank_sel) begin
+      type4_wr_addr_full = (type4_kv_slot * type4_kv_stride) + decoded_data_idx_q;
+    end else begin
+      type4_wr_addr_full = decoded_data_idx_q;
+    end
+    type4_wr_addr = type4_wr_addr_full[SRAM_ADDR_W-1:0];
+
+    if (decoded_payload_len_q == 6'd0) begin
+      type4_payload_bytes = 6'd0;
+    end else if (decoded_payload_len_q > 6'd32) begin
+      type4_payload_bytes = 6'd32;
+    end else begin
+      type4_payload_bytes = decoded_payload_len_q;
+    end
+
+    if (type4_wr_addr_full >= SRAM_DEPTH) begin
+      type4_bytes_to_sram_end_full = 32'd0;
+    end else begin
+      type4_bytes_to_sram_end_full = SRAM_DEPTH_U32 - type4_wr_addr_full;
+    end
+    if (type4_bytes_to_sram_end_full > 32'd32) begin
+      type4_bytes_to_sram_end = 6'd32;
+    end else begin
+      type4_bytes_to_sram_end = type4_bytes_to_sram_end_full[5:0];
+    end
+
+    if (type4_payload_bytes < type4_bytes_to_sram_end) begin
+      type4_store_bytes = type4_payload_bytes;
+    end else begin
+      type4_store_bytes = type4_bytes_to_sram_end;
+    end
+  end
 
   // Type5 ALU/MFU side inputs.
-  assign decoded_data_lane = decoded_data_idx_q[4:0];
-  assign decoded_payload_lane = pkt_flit_q[{decoded_data_lane, 3'b000} +: 8];
+  assign decoded_is_data_op =
+      decoded_is_type5_q &&
+      ((decoded_opcode_q == OPCODE_LINEAR) || (decoded_opcode_q == OPCODE_MATMUL));
   assign type5_tail_emit = emit_valid_o && decoded_is_type5_q && decoded_tail_like_q;
+  assign alu_ctrl.start =
+      pkt_valid_q && compute_en && decoded_is_type5_q && !decoded_is_data_op &&
+      !alu_result.busy && !alu_result.valid;
+  assign alu_ctrl.fetch_en = fetch_en;
+  assign alu_ctrl.compute_en = compute_en;
+  assign alu_ctrl.state_release = type5_tail_emit;
+  always_comb begin : proc_alu_op
+    alu_op = '0;
+    alu_op.opcode = decoded_opcode_q;
+    alu_op.msg_type = decoded_is_type5_q ? ROUTER_MSG_COMP :
+                                           pkt_meta_q.msg_type;
+    alu_op.is_type5 = decoded_is_type5_q;
+    alu_op.is_data_op = decoded_is_data_op;
+    alu_op.is_attention = decoded_is_type5_q && (decoded_opcode_q == OPCODE_ATTENTION);
+  end
+  assign alu_ctx.vc_id = pkt_vc_q;
+  assign alu_ctx.out_sel = pkt_out_sel_q;
+  assign alu_ctx.kv_token_count = type4_kv_token_count_q;
+  assign alu_ctx.task_count = cnoc_task_count_i;
+  assign alu_ctx.task_ids_flat = cnoc_task_ids_flat_i;
+  assign alu_ctx.weight_row_size = cnoc_weight_row_size_i;
+  assign alu_data_wr.valid = sram_wr_en;
+  assign alu_data_wr.bank_sel = sram_wr_bank_sel;
+  assign alu_data_wr.addr = sram_wr_addr;
+  assign alu_data_wr.byte_en = sram_wr_byte_en;
+  assign alu_data_wr.data = sram_wr_data;
+  assign alu_data_rsp.rdata = sram_rdata;
 
+`ifdef ROUTER_ENABLE_COSIM
   // Status bridge outputs.
   assign weight_bytes_stored_o = weight_bytes_stored_q;
   assign kv_bytes_stored_o = kv_bytes_stored_q;
-  assign kv_token_count_o = kv_token_count_q;
+  assign kv_token_count_o = type4_kv_token_count_q;
   assign last_type4_store_valid_o = last_type4_store_valid_q;
   assign last_type4_store_bank_o = last_type4_store_bank_q;
   assign last_type4_store_addr_o = last_type4_store_addr_q;
   assign last_type4_store_bytes_o = last_type4_store_bytes_q;
+`endif
 
   always_ff @(posedge clk) begin : proc_mfu_registers
     // Reset clears the one-entry MFU pipeline and the status bridge counters.
@@ -259,22 +282,21 @@ module cnoc_mfu #(
       decoded_is_type4_q <= 1'b0;
       decoded_is_type5_q <= 1'b0;
       decoded_tail_like_q <= 1'b0;
-      fetch_operand_a_q <= 32'sd0;
-      fetch_operand_b_q <= 32'sd0;
-      processed_flit_q <= '0;
-      processed_meta_q <= '0;
-      kv_token_count_q <= 16'd0;
+      type4_kv_token_count_q <= 16'd0;
+`ifdef ROUTER_ENABLE_COSIM
       weight_bytes_stored_q <= 32'd0;
       kv_bytes_stored_q <= 32'd0;
       last_type4_store_valid_q <= 1'b0;
       last_type4_store_bank_q <= 1'b0;
       last_type4_store_addr_q <= '0;
       last_type4_store_bytes_q <= '0;
+`endif
     end else begin
+`ifdef ROUTER_ENABLE_COSIM
       // last_type4_store_* is a one-cycle event pulse used by the wrapper/status
       // bridge; clear it unless a type4 emit below refreshes it.
       last_type4_store_valid_q <= 1'b0;
-
+`endif
       // Capture a newly selected cNoC flit when the MFU pipeline is empty.  The
       // raw flit is removed from the normal output path by Router.sv in the same
       // cycle through mfu_capture.
@@ -298,28 +320,16 @@ module cnoc_mfu #(
         decoded_tail_like_q <= decode_tail_like;
       end
 
-      // FETCH latches scalar operands before COMPUTE can start the ALU backend.
-      if (fetch_en) begin
-        fetch_operand_a_q <= {{24{decoded_payload_lane[7]}}, decoded_payload_lane};
-        fetch_operand_b_q <= {{24{sram_rdata[7]}}, sram_rdata};
-      end
-
-      // Latch the ALU payload/meta exactly when the latency-aware ALU declares
-      // the functional result visible to the rest of the MFU pipeline.
-      if (alu_result_valid) begin
-        processed_flit_q <= alu_result_flit;
-        processed_meta_q <= alu_result_meta;
-      end
-
       // emit_valid_o means the processed flit has both completed MFU work and
       // has downstream credit to leave this router.
       if (emit_valid_o) begin
+`ifdef ROUTER_ENABLE_COSIM
         // Type4 emit is the point where the local SRAM/KV write has committed.
         // Update the status bridge from the same transaction.
         if (decoded_is_type4_q) begin
           last_type4_store_valid_q <= 1'b1;
           last_type4_store_bank_q <= (decoded_opcode_q == OPCODE_ATTENTION);
-          last_type4_store_addr_q <= storage_wr_addr;
+          last_type4_store_addr_q <= type4_wr_addr;
           last_type4_store_bytes_q <= type4_store_bytes;
           // Attention type4 packets fill the KV-cache bank.
           if (decoded_opcode_q == OPCODE_ATTENTION) begin
@@ -329,11 +339,12 @@ module cnoc_mfu #(
             weight_bytes_stored_q <= weight_bytes_stored_q + {26'd0, type4_store_bytes};
           end
         end
+`endif
         // Tail/head-tail of an Attention type4 packet marks one logical KV token
         // complete, so the next token advances to the next sink/ring slot.
         if (decoded_is_type4_q && decoded_opcode_q == OPCODE_ATTENTION &&
             decoded_tail_like_q) begin
-          kv_token_count_q <= kv_token_count_q + 16'd1;
+          type4_kv_token_count_q <= type4_kv_token_count_q + 16'd1;
         end
         // The one-entry MFU pipeline is now free to capture the next cNoC flit.
         pkt_valid_q <= 1'b0;
@@ -366,7 +377,7 @@ module cnoc_mfu #(
   );
 
   mfu_sram #(
-      .DATA_W(8),
+      .DATA_W(ALU_DATA_W),
       .DEPTH(SRAM_DEPTH),
       .ADDR_W(SRAM_ADDR_W)
   ) mfu_mem_i (
@@ -386,20 +397,20 @@ module cnoc_mfu #(
       .ADDR_W(SRAM_ADDR_W)
   ) mfu_sram_if_i (
       .emit_valid_i(emit_valid_o),
-      .pkt_is_type4_i(decoded_is_type4_q),
-      .pkt_opcode_i(decoded_opcode_q),
-      .pkt_data_idx_i(decoded_data_idx_q),
-      .pkt_payload_len_i(decoded_payload_len_q),
-      .pkt_payload_i(pkt_flit_q[255:0]),
-      .pkt_storage_addr_i(storage_wr_addr),
-      .pkt_store_bytes_i(type4_store_bytes),
+      .type4_valid_i(decoded_is_type4_q),
+      .type4_bank_sel_i(type4_bank_sel),
+      .type4_addr_i(type4_wr_addr),
+      .type4_store_bytes_i(type4_store_bytes),
+      .type4_payload_i(pkt_flit_q[255:0]),
+      .scalar_opcode_i(decoded_opcode_q),
+      .scalar_data_idx_i(decoded_data_idx_q),
       .sram_wr_en_o(sram_wr_en),
       .sram_wr_bank_sel_o(sram_wr_bank_sel),
       .sram_wr_addr_o(sram_wr_addr),
       .sram_wr_byte_en_o(sram_wr_byte_en),
       .sram_wr_data_o(sram_wr_data),
-      .sram_rd_bank_sel_o(sram_rd_bank_sel),
-      .sram_rd_addr_o(sram_rd_addr)
+      .sram_rd_bank_sel_o(mfu_sram_if_rd_bank_sel),
+      .sram_rd_addr_o(mfu_sram_if_rd_addr)
   );
 
   mfu_writeback #(
@@ -408,100 +419,43 @@ module cnoc_mfu #(
       .pkt_flit_i(pkt_flit_q),
       .pkt_meta_i(pkt_meta_q),
       .pkt_is_type5_i(decoded_is_type5_q),
-      .alu_flit_i(processed_flit_q),
-      .alu_meta_i(processed_meta_q),
-      .matmul_active_i(matmul_active),
-      .matmul_flit_i(matmul_writeback_flit),
-      .attention_active_i(attention_active),
-      .attention_flit_i(attention_writeback_flit),
-      .attention_meta_i(attention_writeback_meta),
+      .alu_flit_i(alu_result.flit),
+      .alu_meta_i(alu_result.meta),
+      .attention_active_i(alu_result.attention_active),
+      .attention_flit_i(alu_result.attention_flit),
+      .attention_meta_i(alu_result.attention_meta),
       .emit_flit_o(writeback_flit),
       .emit_meta_o(emit_meta_o)
   );
 
-  mfu_matmul #(
-      .NUM_PORTS(NUM_PORTS),
-      .VC_NUM(VC_NUM),
-      .VC_ID_W(VC_ID_W),
-      .FLIT_W(FLIT_W),
-      .SRAM_DEPTH(SRAM_DEPTH),
-      .SRAM_ADDR_W(SRAM_ADDR_W)
-  ) mfu_matmul_i (
-      .clk(clk),
-      .reset(reset),
-      .weight_wr_en_i(matmul_weight_wr_en),
-      .weight_wr_addr_i(sram_wr_addr),
-      .weight_wr_byte_en_i(sram_wr_byte_en),
-      .weight_wr_data_i(sram_wr_data),
-      .compute_fire_i(compute_fire),
-      .release_state_i(type5_tail_emit),
-      .pkt_is_type5_i(decoded_is_type5_q),
-      .pkt_opcode_i(decoded_opcode_q),
-      .pkt_flit_i(pkt_flit_q),
-      .pkt_meta_i(pkt_meta_q),
-      .pkt_vc_id_i(pkt_vc_q),
-      .pkt_out_sel_i(pkt_out_sel_q),
-      .task_count_i(cnoc_task_count_i),
-      .task_ids_flat_i(cnoc_task_ids_flat_i),
-      .weight_row_size_i(cnoc_weight_row_size_i),
-      .matmul_active_o(matmul_active),
-      .matmul_flit_o(matmul_writeback_flit)
-  );
-
-  mfu_attention #(
-      .NUM_PORTS(NUM_PORTS),
-      .VC_NUM(VC_NUM),
-      .VC_ID_W(VC_ID_W),
-      .FLIT_W(FLIT_W),
-      .SRAM_DEPTH(SRAM_DEPTH),
-      .SRAM_ADDR_W(SRAM_ADDR_W)
-  ) mfu_attention_i (
-      .clk(clk),
-      .reset(reset),
-      .kv_wr_en_i(attention_kv_wr_en),
-      .kv_wr_addr_i(sram_wr_addr),
-      .kv_wr_byte_en_i(sram_wr_byte_en),
-      .kv_wr_data_i(sram_wr_data),
-      .compute_fire_i(compute_fire),
-      .release_state_i(type5_tail_emit),
-      .pkt_is_type5_i(decoded_is_type5_q),
-      .pkt_opcode_i(decoded_opcode_q),
-      .pkt_flit_i(pkt_flit_q),
-      .pkt_meta_i(pkt_meta_q),
-      .pkt_vc_id_i(pkt_vc_q),
-      .pkt_out_sel_i(pkt_out_sel_q),
-      .kv_token_count_i(kv_token_count_q),
-      .task_count_i(cnoc_task_count_i),
-      .task_ids_flat_i(cnoc_task_ids_flat_i),
-      .attention_active_o(attention_active),
-      .attention_flit_o(attention_writeback_flit),
-      .attention_meta_o(attention_writeback_meta)
-  );
-
   mfu_alu #(
+      .NUM_PORTS(NUM_PORTS),
+      .VC_NUM(VC_NUM),
+      .VC_ID_W(VC_ID_W),
       .FLIT_W(FLIT_W),
-      .LAT_LINEAR(MFU_LAT_LINEAR),
-      .LAT_MATMUL(MFU_LAT_MATMUL),
-      .LAT_ADD(MFU_LAT_ADD),
-      .LAT_SWIGLU(MFU_LAT_SWIGLU),
-      .LAT_GEGLU(MFU_LAT_GEGLU),
-      .LAT_ATTENTION(MFU_LAT_ATTENTION),
-      .LAT_DEFAULT(MFU_LAT_DEFAULT),
-      .LAT_TYPE4_STORE(MFU_LAT_TYPE4_STORE)
+      .SRAM_DEPTH(SRAM_DEPTH),
+      .SRAM_ADDR_W(SRAM_ADDR_W),
+      .DATA_W(ALU_DATA_W),
+      .DATA_ELEM_W(ALU_DATA_ELEM_W),
+      .DATA_ACC_W(MFU_MATMUL_ACC_W)
   ) mfu_datapath_alu_i (
       .clk_i(clk),
       .reset_i(reset),
-      .start_i(alu_start),
+      .ctrl_i(alu_ctrl),
+      .op_i(alu_op),
       .flit_i(pkt_flit_q),
       .meta_i(pkt_meta_q),
-      .op_a_i(fetch_operand_a_q),
-      .op_b_i(fetch_operand_b_q),
-      .busy_o(alu_busy),
-      .result_valid_o(alu_result_valid),
-      .result_flit_o(alu_result_flit),
-      .result_meta_o(alu_result_meta),
-      .result_scalar_o()
+      .ctx_i(alu_ctx),
+      .data_wr_i(alu_data_wr),
+      .data_rsp_i(alu_data_rsp),
+      .data_req_o(alu_data_req),
+      .result_o(alu_result)
   );
+
+  assign sram_rd_bank_sel =
+      alu_data_req.valid ? alu_data_req.bank_sel : mfu_sram_if_rd_bank_sel;
+  assign sram_rd_addr =
+      alu_data_req.valid ? alu_data_req.addr : mfu_sram_if_rd_addr;
 
 `ifndef SYNTHESIS
   always_ff @(posedge clk) begin : proc_assertions

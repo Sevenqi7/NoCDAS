@@ -274,20 +274,19 @@ module router_unit_tb;
   logic mfu_if_type4;
   logic [4:0] mfu_if_opcode;
   logic [9:0] mfu_if_data_idx;
-  logic [5:0] mfu_if_payload_len;
   logic [255:0] mfu_if_payload;
   logic [10:0] mfu_if_storage_addr;
   logic [5:0] mfu_if_store_bytes;
 
   mfu_sram_if mfu_sram_if_i (
       .emit_valid_i(mfu_if_emit_valid),
-      .pkt_is_type4_i(mfu_if_type4),
-      .pkt_opcode_i(mfu_if_opcode),
-      .pkt_data_idx_i(mfu_if_data_idx),
-      .pkt_payload_len_i(mfu_if_payload_len),
-      .pkt_payload_i(mfu_if_payload),
-      .pkt_storage_addr_i(mfu_if_storage_addr),
-      .pkt_store_bytes_i(mfu_if_store_bytes),
+      .type4_valid_i(mfu_if_type4),
+      .type4_bank_sel_i(mfu_if_opcode == 5'd23),
+      .type4_addr_i(mfu_if_storage_addr),
+      .type4_store_bytes_i(mfu_if_store_bytes),
+      .type4_payload_i(mfu_if_payload),
+      .scalar_opcode_i(mfu_if_opcode),
+      .scalar_data_idx_i(mfu_if_data_idx),
       .sram_wr_en_o(mfu_sram_wr_en),
       .sram_wr_bank_sel_o(mfu_sram_wr_bank_sel),
       .sram_wr_addr_o(mfu_sram_wr_addr),
@@ -303,8 +302,6 @@ module router_unit_tb;
   logic [FLIT_W-1:0] wb_flit_out;
   flit_meta_t wb_alu_meta;
   logic [FLIT_W-1:0] wb_alu_flit;
-  logic wb_matmul_active;
-  logic [FLIT_W-1:0] wb_matmul_flit;
 
   mfu_writeback #(
       .FLIT_W(FLIT_W)
@@ -314,8 +311,6 @@ module router_unit_tb;
       .pkt_is_type5_i(1'b1),
       .alu_flit_i(wb_alu_flit),
       .alu_meta_i(wb_alu_meta),
-      .matmul_active_i(wb_matmul_active),
-      .matmul_flit_i(wb_matmul_flit),
       .attention_active_i(1'b0),
       .attention_flit_i('0),
       .attention_meta_i('0),
@@ -331,24 +326,50 @@ module router_unit_tb;
   logic [FLIT_W-1:0] alu0_flit_out;
   flit_meta_t alu0_meta_out;
   logic signed [31:0] alu0_scalar_out;
+  mfu_alu_ctrl_t alu0_ctrl;
+  mfu_alu_ctx_t alu0_ctx;
+  mfu_alu_data_wr_t alu0_data_wr;
+  mfu_alu_data_rsp_t alu0_data_rsp;
+  mfu_alu_data_req_t alu0_data_req;
+  mfu_alu_op_t alu0_op;
+  mfu_alu_result_t alu0_result;
+
+  assign alu0_ctrl.start = alu0_start;
+  assign alu0_ctrl.fetch_en = 1'b0;
+  assign alu0_ctrl.compute_en = 1'b0;
+  assign alu0_ctrl.state_release = 1'b0;
+  assign alu0_ctx = '0;
+  assign alu0_data_wr = '0;
+  assign alu0_data_rsp = '0;
+  assign alu0_op.opcode = alu0_meta_in.opcode;
+  assign alu0_op.msg_type = alu0_meta_in.msg_type;
+  assign alu0_op.is_type5 = (alu0_meta_in.msg_type == ROUTER_MSG_COMP);
+  assign alu0_op.is_data_op =
+      (alu0_meta_in.msg_type == ROUTER_MSG_COMP) &&
+      ((alu0_meta_in.opcode == 5'd0) || (alu0_meta_in.opcode == 5'd15));
+  assign alu0_op.is_attention =
+      (alu0_meta_in.msg_type == ROUTER_MSG_COMP) && (alu0_meta_in.opcode == 5'd23);
 
   mfu_alu #(
-      .FLIT_W(FLIT_W),
-      .LAT_ADD(0)
+      .FLIT_W(FLIT_W)
   ) mfu_alu_zero_lat_i (
       .clk_i(clk),
       .reset_i(reset),
-      .start_i(alu0_start),
+      .ctrl_i(alu0_ctrl),
+      .op_i(alu0_op),
       .flit_i(alu0_flit_in),
       .meta_i(alu0_meta_in),
-      .op_a_i(32'sd0),
-      .op_b_i(32'sd0),
-      .busy_o(alu0_busy),
-      .result_valid_o(alu0_valid),
-      .result_flit_o(alu0_flit_out),
-      .result_meta_o(alu0_meta_out),
-      .result_scalar_o(alu0_scalar_out)
+      .ctx_i(alu0_ctx),
+      .data_wr_i(alu0_data_wr),
+      .data_rsp_i(alu0_data_rsp),
+      .data_req_o(alu0_data_req),
+      .result_o(alu0_result)
   );
+  assign alu0_busy = alu0_result.busy;
+  assign alu0_valid = alu0_result.valid;
+  assign alu0_flit_out = alu0_result.flit;
+  assign alu0_meta_out = alu0_result.meta;
+  assign alu0_scalar_out = alu0_result.scalar;
 
   logic alu3_start;
   logic alu3_busy;
@@ -358,97 +379,89 @@ module router_unit_tb;
   logic [FLIT_W-1:0] alu3_flit_out;
   flit_meta_t alu3_meta_out;
   logic signed [31:0] alu3_scalar_out;
+  mfu_alu_ctrl_t alu3_ctrl;
+  mfu_alu_ctx_t alu3_ctx;
+  mfu_alu_data_wr_t alu3_data_wr;
+  mfu_alu_data_rsp_t alu3_data_rsp;
+  mfu_alu_data_req_t alu3_data_req;
+  mfu_alu_op_t alu3_op;
+  mfu_alu_result_t alu3_result;
+
+  assign alu3_ctrl.start = alu3_start;
+  assign alu3_ctrl.fetch_en = 1'b0;
+  assign alu3_ctrl.compute_en = 1'b0;
+  assign alu3_ctrl.state_release = 1'b0;
+  assign alu3_ctx = '0;
+  assign alu3_data_wr = '0;
+  assign alu3_data_rsp = '0;
+  assign alu3_op.opcode = alu3_meta_in.opcode;
+  assign alu3_op.msg_type = alu3_meta_in.msg_type;
+  assign alu3_op.is_type5 = (alu3_meta_in.msg_type == ROUTER_MSG_COMP);
+  assign alu3_op.is_data_op =
+      (alu3_meta_in.msg_type == ROUTER_MSG_COMP) &&
+      ((alu3_meta_in.opcode == 5'd0) || (alu3_meta_in.opcode == 5'd15));
+  assign alu3_op.is_attention =
+      (alu3_meta_in.msg_type == ROUTER_MSG_COMP) && (alu3_meta_in.opcode == 5'd23);
 
   mfu_alu #(
-      .FLIT_W(FLIT_W),
-      .LAT_GEGLU(3)
+      .FLIT_W(FLIT_W)
   ) mfu_alu_three_lat_i (
       .clk_i(clk),
       .reset_i(reset),
-      .start_i(alu3_start),
+      .ctrl_i(alu3_ctrl),
+      .op_i(alu3_op),
       .flit_i(alu3_flit_in),
       .meta_i(alu3_meta_in),
-      .op_a_i(32'sd0),
-      .op_b_i(32'sd0),
-      .busy_o(alu3_busy),
-      .result_valid_o(alu3_valid),
-      .result_flit_o(alu3_flit_out),
-      .result_meta_o(alu3_meta_out),
-      .result_scalar_o(alu3_scalar_out)
+      .ctx_i(alu3_ctx),
+      .data_wr_i(alu3_data_wr),
+      .data_rsp_i(alu3_data_rsp),
+      .data_req_o(alu3_data_req),
+      .result_o(alu3_result)
   );
+  assign alu3_busy = alu3_result.busy;
+  assign alu3_valid = alu3_result.valid;
+  assign alu3_flit_out = alu3_result.flit;
+  assign alu3_meta_out = alu3_result.meta;
+  assign alu3_scalar_out = alu3_result.scalar;
 
   logic [FLIT_W-1:0] alu_leaf_flit_in;
   flit_meta_t alu_leaf_meta_in;
   logic signed [31:0] alu_leaf_op_a;
   logic signed [31:0] alu_leaf_op_b;
-  logic [FLIT_W-1:0] alu_type4_flit_out;
-  flit_meta_t alu_type4_meta_out;
-  logic signed [31:0] alu_type4_scalar_out;
-  logic [FLIT_W-1:0] alu_linear_flit_out;
-  flit_meta_t alu_linear_meta_out;
-  logic signed [31:0] alu_linear_scalar_out;
-  logic [FLIT_W-1:0] alu_matmul_flit_out;
-  flit_meta_t alu_matmul_meta_out;
-  logic signed [31:0] alu_matmul_scalar_out;
+  logic alu_leaf_start;
   logic [FLIT_W-1:0] alu_add_flit_out;
   flit_meta_t alu_add_meta_out;
+  logic alu_add_busy;
+  logic alu_add_valid;
   logic signed [31:0] alu_add_scalar_out;
   logic [FLIT_W-1:0] alu_swiglu_flit_out;
   flit_meta_t alu_swiglu_meta_out;
+  logic alu_swiglu_busy;
+  logic alu_swiglu_valid;
   logic signed [31:0] alu_swiglu_scalar_out;
   logic [FLIT_W-1:0] alu_geglu_flit_out;
   flit_meta_t alu_geglu_meta_out;
+  logic alu_geglu_busy;
+  logic alu_geglu_valid;
   logic signed [31:0] alu_geglu_scalar_out;
-  logic [FLIT_W-1:0] alu_attention_flit_out;
-  flit_meta_t alu_attention_meta_out;
-  logic signed [31:0] alu_attention_scalar_out;
   logic [FLIT_W-1:0] alu_default_flit_out;
   flit_meta_t alu_default_meta_out;
+  logic alu_default_busy;
+  logic alu_default_valid;
   logic signed [31:0] alu_default_scalar_out;
-
-  mfu_alu_type4_store #(
-      .FLIT_W(FLIT_W)
-  ) mfu_alu_type4_store_i (
-      .flit_i(alu_leaf_flit_in),
-      .meta_i(alu_leaf_meta_in),
-      .op_a_i(alu_leaf_op_a),
-      .op_b_i(alu_leaf_op_b),
-      .result_flit_o(alu_type4_flit_out),
-      .result_meta_o(alu_type4_meta_out),
-      .result_scalar_o(alu_type4_scalar_out)
-  );
-
-  mfu_alu_linear #(
-      .FLIT_W(FLIT_W)
-  ) mfu_alu_linear_i (
-      .flit_i(alu_leaf_flit_in),
-      .meta_i(alu_leaf_meta_in),
-      .op_a_i(alu_leaf_op_a),
-      .op_b_i(alu_leaf_op_b),
-      .result_flit_o(alu_linear_flit_out),
-      .result_meta_o(alu_linear_meta_out),
-      .result_scalar_o(alu_linear_scalar_out)
-  );
-
-  mfu_alu_matmul #(
-      .FLIT_W(FLIT_W)
-  ) mfu_alu_matmul_i (
-      .flit_i(alu_leaf_flit_in),
-      .meta_i(alu_leaf_meta_in),
-      .op_a_i(alu_leaf_op_a),
-      .op_b_i(alu_leaf_op_b),
-      .result_flit_o(alu_matmul_flit_out),
-      .result_meta_o(alu_matmul_meta_out),
-      .result_scalar_o(alu_matmul_scalar_out)
-  );
 
   mfu_alu_add #(
       .FLIT_W(FLIT_W)
   ) mfu_alu_add_i (
+      .clk_i(clk),
+      .reset_i(reset),
+      .start_i(alu_leaf_start),
       .flit_i(alu_leaf_flit_in),
       .meta_i(alu_leaf_meta_in),
-      .op_a_i(alu_leaf_op_a),
-      .op_b_i(alu_leaf_op_b),
+      .scalar_a_i(alu_leaf_op_a),
+      .scalar_b_i(alu_leaf_op_b),
+      .busy_o(alu_add_busy),
+      .valid_o(alu_add_valid),
       .result_flit_o(alu_add_flit_out),
       .result_meta_o(alu_add_meta_out),
       .result_scalar_o(alu_add_scalar_out)
@@ -457,10 +470,15 @@ module router_unit_tb;
   mfu_alu_swiglu #(
       .FLIT_W(FLIT_W)
   ) mfu_alu_swiglu_i (
+      .clk_i(clk),
+      .reset_i(reset),
+      .start_i(alu_leaf_start),
       .flit_i(alu_leaf_flit_in),
       .meta_i(alu_leaf_meta_in),
-      .op_a_i(alu_leaf_op_a),
-      .op_b_i(alu_leaf_op_b),
+      .scalar_a_i(alu_leaf_op_a),
+      .scalar_b_i(alu_leaf_op_b),
+      .busy_o(alu_swiglu_busy),
+      .valid_o(alu_swiglu_valid),
       .result_flit_o(alu_swiglu_flit_out),
       .result_meta_o(alu_swiglu_meta_out),
       .result_scalar_o(alu_swiglu_scalar_out)
@@ -469,51 +487,37 @@ module router_unit_tb;
   mfu_alu_geglu #(
       .FLIT_W(FLIT_W)
   ) mfu_alu_geglu_i (
+      .clk_i(clk),
+      .reset_i(reset),
+      .start_i(alu_leaf_start),
       .flit_i(alu_leaf_flit_in),
       .meta_i(alu_leaf_meta_in),
-      .op_a_i(alu_leaf_op_a),
-      .op_b_i(alu_leaf_op_b),
+      .scalar_a_i(alu_leaf_op_a),
+      .scalar_b_i(alu_leaf_op_b),
+      .busy_o(alu_geglu_busy),
+      .valid_o(alu_geglu_valid),
       .result_flit_o(alu_geglu_flit_out),
       .result_meta_o(alu_geglu_meta_out),
       .result_scalar_o(alu_geglu_scalar_out)
   );
 
-  mfu_alu_attention #(
-      .FLIT_W(FLIT_W)
-  ) mfu_alu_attention_i (
-      .flit_i(alu_leaf_flit_in),
-      .meta_i(alu_leaf_meta_in),
-      .op_a_i(alu_leaf_op_a),
-      .op_b_i(alu_leaf_op_b),
-      .result_flit_o(alu_attention_flit_out),
-      .result_meta_o(alu_attention_meta_out),
-      .result_scalar_o(alu_attention_scalar_out)
-  );
-
   mfu_alu_default #(
       .FLIT_W(FLIT_W)
   ) mfu_alu_default_i (
+      .clk_i(clk),
+      .reset_i(reset),
+      .start_i(alu_leaf_start),
       .flit_i(alu_leaf_flit_in),
       .meta_i(alu_leaf_meta_in),
-      .op_a_i(alu_leaf_op_a),
-      .op_b_i(alu_leaf_op_b),
+      .scalar_a_i(alu_leaf_op_a),
+      .scalar_b_i(alu_leaf_op_b),
+      .busy_o(alu_default_busy),
+      .valid_o(alu_default_valid),
       .result_flit_o(alu_default_flit_out),
       .result_meta_o(alu_default_meta_out),
       .result_scalar_o(alu_default_scalar_out)
   );
 
-  logic mm_weight_wr_en;
-  logic [10:0] mm_weight_wr_addr;
-  logic [31:0] mm_weight_wr_byte_en;
-  logic [FLIT_W-1:0] mm_weight_wr_data;
-  logic mm_compute_fire;
-  logic mm_release_state;
-  logic [FLIT_W-1:0] mm_flit_in;
-  flit_meta_t mm_meta_in;
-  logic [FLIT_W-1:0] mm_flit_out;
-  logic mm_active;
-  logic [15:0] mm_weight_row_size;
-  logic [CNOC_MAX_TASKS*CNOC_TASK_ID_W-1:0] mm_task_ids_flat;
   logic att_kv_wr_en;
   logic [10:0] att_kv_wr_addr;
   logic [31:0] att_kv_wr_byte_en;
@@ -525,59 +529,48 @@ module router_unit_tb;
   logic [FLIT_W-1:0] att_flit_out;
   flit_meta_t att_meta_out;
   logic att_active;
+  logic att_busy;
+  logic att_valid;
   logic [CNOC_MAX_TASKS*CNOC_TASK_ID_W-1:0] att_task_ids_flat;
+  mfu_alu_data_wr_t att_data_wr;
+  mfu_alu_ctx_t att_ctx;
+  mfu_alu_op_t att_op;
 
-  mfu_matmul #(
-      .NUM_PORTS(NUM_PORTS),
-      .VC_NUM(VC_NUM),
-      .VC_ID_W(VC_ID_W),
-      .FLIT_W(FLIT_W)
-  ) mfu_matmul_i (
-      .clk(clk),
-      .reset(reset),
-      .weight_wr_en_i(mm_weight_wr_en),
-      .weight_wr_addr_i(mm_weight_wr_addr),
-      .weight_wr_byte_en_i(mm_weight_wr_byte_en),
-      .weight_wr_data_i(mm_weight_wr_data),
-      .compute_fire_i(mm_compute_fire),
-      .release_state_i(mm_release_state),
-      .pkt_is_type5_i(1'b1),
-      .pkt_opcode_i(5'd15),
-      .pkt_flit_i(mm_flit_in),
-      .pkt_meta_i(mm_meta_in),
-      .pkt_vc_id_i(3'd0),
-      .pkt_out_sel_i(ROUTER_PORT_LOCAL),
-      .task_count_i(6'd2),
-      .task_ids_flat_i(mm_task_ids_flat),
-      .weight_row_size_i(mm_weight_row_size),
-      .matmul_active_o(mm_active),
-      .matmul_flit_o(mm_flit_out)
-  );
+  assign att_data_wr.valid = att_kv_wr_en;
+  assign att_data_wr.bank_sel = 1'b1;
+  assign att_data_wr.addr = att_kv_wr_addr;
+  assign att_data_wr.byte_en = att_kv_wr_byte_en;
+  assign att_data_wr.data = att_kv_wr_data;
+  assign att_ctx.vc_id = 3'd0;
+  assign att_ctx.out_sel = ROUTER_PORT_LOCAL;
+  assign att_ctx.kv_token_count = 16'd1;
+  assign att_ctx.task_count = 6'd2;
+  assign att_ctx.task_ids_flat = att_task_ids_flat;
+  assign att_ctx.weight_row_size = 16'd0;
+  assign att_op.opcode = 5'd23;
+  assign att_op.msg_type = ROUTER_MSG_COMP;
+  assign att_op.is_type5 = 1'b1;
+  assign att_op.is_data_op = 1'b0;
+  assign att_op.is_attention = 1'b1;
 
-  mfu_attention #(
+  mfu_alu_attention #(
       .NUM_PORTS(NUM_PORTS),
       .VC_NUM(VC_NUM),
       .VC_ID_W(VC_ID_W),
       .FLIT_W(FLIT_W),
       .MAX_K_DIM(4)
-  ) mfu_attention_i (
+  ) mfu_alu_attention_i (
       .clk(clk),
       .reset(reset),
-      .kv_wr_en_i(att_kv_wr_en),
-      .kv_wr_addr_i(att_kv_wr_addr),
-      .kv_wr_byte_en_i(att_kv_wr_byte_en),
-      .kv_wr_data_i(att_kv_wr_data),
-      .compute_fire_i(att_compute_fire),
+      .op_i(att_op),
+      .data_wr_i(att_data_wr),
+      .ctx_i(att_ctx),
+      .start_i(att_compute_fire),
       .release_state_i(att_release_state),
-      .pkt_is_type5_i(1'b1),
-      .pkt_opcode_i(5'd23),
       .pkt_flit_i(att_flit_in),
       .pkt_meta_i(att_meta_in),
-      .pkt_vc_id_i(3'd0),
-      .pkt_out_sel_i(ROUTER_PORT_LOCAL),
-      .kv_token_count_i(16'd1),
-      .task_count_i(6'd2),
-      .task_ids_flat_i(att_task_ids_flat),
+      .busy_o(att_busy),
+      .valid_o(att_valid),
       .attention_active_o(att_active),
       .attention_flit_o(att_flit_out),
       .attention_meta_o(att_meta_out)
@@ -624,8 +617,7 @@ module router_unit_tb;
   Router #(
       .VC_NUM(VC_NUM),
       .VC_ID_W(VC_ID_W),
-      .FLIT_W(FLIT_W),
-      .MFU_LAT_ATTENTION(0)
+      .FLIT_W(FLIT_W)
   ) router_top_i (
       .X_cur(3'd1),
       .Y_cur(3'd1),
@@ -1043,7 +1035,6 @@ module router_unit_tb;
     mfu_if_type4 = 1'b0;
     mfu_if_opcode = '0;
     mfu_if_data_idx = '0;
-    mfu_if_payload_len = '0;
     mfu_if_payload = '0;
     mfu_if_storage_addr = '0;
     mfu_if_store_bytes = '0;
@@ -1051,8 +1042,6 @@ module router_unit_tb;
     wb_flit_in = '0;
     wb_alu_meta = '0;
     wb_alu_flit = '0;
-    wb_matmul_active = 1'b0;
-    wb_matmul_flit = '0;
     alu0_start = 1'b0;
     alu0_flit_in = '0;
     alu0_meta_in = '0;
@@ -1063,18 +1052,7 @@ module router_unit_tb;
     alu_leaf_meta_in = '0;
     alu_leaf_op_a = '0;
     alu_leaf_op_b = '0;
-    mm_weight_wr_en = 1'b0;
-    mm_weight_wr_addr = '0;
-    mm_weight_wr_byte_en = '0;
-    mm_weight_wr_data = '0;
-    mm_compute_fire = 1'b0;
-    mm_release_state = 1'b0;
-    mm_flit_in = '0;
-    mm_meta_in = '0;
-    mm_weight_row_size = 16'd2;
-    mm_task_ids_flat = '0;
-    mm_task_ids_flat[0 +: CNOC_TASK_ID_W] = 16'd0;
-    mm_task_ids_flat[CNOC_TASK_ID_W +: CNOC_TASK_ID_W] = 16'd1;
+    alu_leaf_start = 1'b0;
     att_kv_wr_en = 1'b0;
     att_kv_wr_addr = '0;
     att_kv_wr_byte_en = '0;
@@ -1396,7 +1374,6 @@ module router_unit_tb;
     mfu_if_type4 = 1'b1;
     mfu_if_opcode = 5'd23;  // attention -> KV bank
     mfu_if_data_idx = 10'd17;
-    mfu_if_payload_len = 6'd2;
     mfu_if_store_bytes = 6'd2;
     mfu_if_payload[7:0] = 8'hA5;
     mfu_if_payload[15:8] = 8'h5A;
@@ -1408,7 +1385,6 @@ module router_unit_tb;
     check(mfu_sram_wr_byte_en[1:0] == 2'b11, "type4 SRAM byte enables mismatch");
     check(mfu_sram_wr_data[15:0] == 16'h5AA5, "type4 SRAM write data mismatch");
 
-    mfu_if_payload_len = 6'd63;
     mfu_if_storage_addr = 11'd2040;
     mfu_if_store_bytes = 6'd32;
     #1;
@@ -1427,12 +1403,11 @@ module router_unit_tb;
     check(!mfu_sram_wr_en && mfu_sram_wr_byte_en == 32'h0000_0000,
           "type4 fully out-of-range store should become a deterministic no-op");
 
-    mfu_if_payload_len = 6'd0;
     mfu_if_payload = '0;
-    mfu_if_store_bytes = 6'd1;
+    mfu_if_store_bytes = 6'd0;
     #1;
     check(!mfu_sram_wr_en && mfu_sram_wr_byte_en == 32'h0000_0000,
-          "type4 zero payload_len flit should not write SRAM/KV bytes");
+          "type4 zero-byte transaction should not write SRAM/KV bytes");
 
     // Non-Attention type4 storage uses the same data_offset-derived address
     // model as the MatMul helper's weight bank.  The bank selector must stay on
@@ -1440,7 +1415,6 @@ module router_unit_tb;
     mfu_if_emit_valid = 1'b1;
     mfu_if_type4 = 1'b1;
     mfu_if_opcode = 5'd15;
-    mfu_if_payload_len = 6'd3;
     mfu_if_store_bytes = 6'd3;
     mfu_if_storage_addr = 11'd64;
     mfu_if_payload = '0;
@@ -1454,9 +1428,8 @@ module router_unit_tb;
     check(mfu_sram_wr_byte_en[2:0] == 3'b111, "weight type4 byte enables mismatch");
     check(mfu_sram_wr_data[23:0] == 24'h030201, "weight type4 write data mismatch");
 
-    // Latency-aware ALU: latency 0 returns an ADD result on the next sampled edge
-    // without holding busy, while latency 3 holds busy until the configured delay
-    // expires.
+    // ALU wrapper: leaf modules now own their valid timing.  The functional
+    // scalar leaves are one-cycle start/valid paths with no wrapper wait counter.
     alu0_meta_in = make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                              3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
                              1'b1, 5'd18, 10'd0, 8'h00);
@@ -1470,10 +1443,10 @@ module router_unit_tb;
     alu0_start = 1'b1;
     @(posedge clk);
     #1;
-    check(alu0_valid, "latency-0 ALU did not assert result_valid");
-    check(!alu0_busy, "latency-0 ALU should not remain busy");
-    check(alu0_flit_out[7:0] == 8'd42, "latency-0 ADD lane0 result mismatch");
-    check(alu0_flit_out[23:16] == 8'hf4, "latency-0 ADD lane1 result mismatch");
+    check(alu0_valid, "ADD leaf path did not assert result_valid");
+    check(!alu0_busy, "ADD leaf path should not remain busy");
+    check(alu0_flit_out[7:0] == 8'd42, "ADD lane0 result mismatch");
+    check(alu0_flit_out[23:16] == 8'hf4, "ADD lane1 result mismatch");
     alu0_start = 1'b0;
     @(negedge clk);
 
@@ -1488,86 +1461,67 @@ module router_unit_tb;
     alu3_start = 1'b1;
     @(posedge clk);
     #1;
-    check(!alu3_valid && alu3_busy, "latency-3 ALU should be busy after start");
+    check(alu3_valid && !alu3_busy, "GEGLU leaf path did not complete through valid");
     alu3_start = 1'b0;
-    @(posedge clk);
-    #1;
-    check(!alu3_valid && alu3_busy, "latency-3 ALU completed too early at cycle 1");
-    @(posedge clk);
-    #1;
-    check(!alu3_valid && alu3_busy, "latency-3 ALU completed too early at cycle 2");
-    @(posedge clk);
-    #1;
-    check(alu3_valid && !alu3_busy, "latency-3 ALU did not complete at cycle 3");
+    @(negedge clk);
 
     // Leaf smoke: each opcode-specific module keeps the current functional
     // behavior so the parent ALU shell can later swap in a real RTL pipeline.
-    alu_leaf_meta_in = make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_DIST, ROUTER_TRAFFIC_DIST,
-                                 3'd1, 3'd1, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                                 1'b0, 5'd23, 10'd0, 8'hA5);
-    alu_leaf_meta_in.payload_len = 6'd1;
-    alu_leaf_flit_in = '0;
-    alu_leaf_flit_in[7:0] = 8'hA5;
-    alu_leaf_op_a = 32'sd77;
-    alu_leaf_op_b = 32'sd5;
-    #1;
-    check(alu_type4_flit_out == alu_leaf_flit_in, "type4 leaf did not passthrough flit");
-    check(alu_type4_scalar_out == 32'sd77, "type4 leaf scalar mismatch");
-
-    alu_leaf_meta_in = make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
-                                 3'd1, 3'd1, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                                 1'b0, 5'd0, 10'd0, 8'h00);
-    alu_leaf_meta_in.payload_len = 6'd1;
-    alu_leaf_op_a = 32'sd16;
-    alu_leaf_op_b = 32'sd16;
-    #1;
-    check(alu_linear_scalar_out == 32'sd16, "linear leaf scalar mismatch");
-
-    alu_leaf_meta_in.opcode = 5'd15;
-    #1;
-    check(alu_matmul_scalar_out == 32'sd16, "matmul leaf scalar mismatch");
-
     alu_leaf_meta_in.opcode = 5'd18;
     alu_leaf_meta_in.payload_len = 6'd2;
     alu_leaf_meta_in.header_reserved = 16'h0001;
     alu_leaf_flit_in = '0;
     alu_leaf_flit_in[7:0] = 8'd1;
     alu_leaf_flit_in[15:8] = 8'd2;
+    @(negedge clk);
+    alu_leaf_start = 1'b1;
+    @(posedge clk);
     #1;
+    check(alu_add_valid, "add leaf did not assert valid");
     check(alu_add_flit_out[7:0] == 8'd3, "add leaf lane0 mismatch");
     check(alu_add_scalar_out == 32'sd3, "add leaf scalar mismatch");
+    alu_leaf_start = 1'b0;
+    @(negedge clk);
 
     alu_leaf_meta_in.opcode = 5'd21;
     alu_leaf_flit_in = '0;
     alu_leaf_flit_in[7:0] = 8'd0;
     alu_leaf_flit_in[15:8] = 8'd8;
+    @(negedge clk);
+    alu_leaf_start = 1'b1;
+    @(posedge clk);
     #1;
+    check(alu_swiglu_valid, "swiglu leaf did not assert valid");
     check(alu_swiglu_flit_out[7:0] == 8'd0, "swiglu leaf lane0 mismatch");
     check(alu_swiglu_scalar_out == 32'sd0, "swiglu leaf scalar mismatch");
+    alu_leaf_start = 1'b0;
+    @(negedge clk);
 
     alu_leaf_meta_in.opcode = 5'd24;
+    @(negedge clk);
+    alu_leaf_start = 1'b1;
+    @(posedge clk);
     #1;
+    check(alu_geglu_valid, "geglu leaf did not assert valid");
     check(alu_geglu_flit_out[7:0] == 8'd0, "geglu leaf lane0 mismatch");
     check(alu_geglu_scalar_out == 32'sd0, "geglu leaf scalar mismatch");
-
-    alu_leaf_meta_in.opcode = 5'd23;
-    alu_leaf_meta_in.payload_len = 6'd1;
-    alu_leaf_flit_in = '0;
-    alu_leaf_flit_in[7:0] = 8'd5;
-    alu_leaf_op_a = 32'sd0;
-    alu_leaf_op_b = 32'sd0;
-    #1;
-    check(alu_attention_flit_out[7:0] == 8'd0, "attention leaf lane0 mismatch");
-    check(alu_attention_scalar_out == 32'sd0, "attention leaf scalar mismatch");
+    alu_leaf_start = 1'b0;
+    @(negedge clk);
 
     alu_leaf_meta_in.opcode = 5'd31;
     alu_leaf_flit_in = '0;
     alu_leaf_flit_in[7:0] = 8'h5A;
     alu_leaf_op_a = 32'sd0;
     alu_leaf_op_b = 32'sd16;
+    @(negedge clk);
+    alu_leaf_start = 1'b1;
+    @(posedge clk);
     #1;
+    check(alu_default_valid, "default leaf did not assert valid");
     check(alu_default_flit_out[7:0] == 8'd16, "default leaf lane0 mismatch");
     check(alu_default_scalar_out == 32'sd16, "default leaf scalar mismatch");
+    alu_leaf_start = 1'b0;
+    @(negedge clk);
 
     wb_meta_in = make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                            3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
@@ -1603,157 +1557,6 @@ module router_unit_tb;
     #1;
     check(wb_flit_out[47:40] == 8'd42, "type5 scalar writeback did not honor data_offset lane");
     check(wb_flit_out[7:0] == 8'd0, "type5 scalar writeback incorrectly used lane 0");
-
-    // MatMul helper: type4 writes task-local rows, input flit accumulates, and
-    // the later psum flit receives each assigned task's partial sum.
-    @(negedge clk);
-    mm_weight_wr_data = '0;
-    mm_weight_wr_data[7:0] = 8'd16;    // task0, input0
-    mm_weight_wr_data[15:8] = 8'd32;   // task0, input1
-    mm_weight_wr_data[23:16] = 8'd48;  // task1, input0
-    mm_weight_wr_data[31:24] = 8'd64;  // task1, input1
-    mm_weight_wr_addr = 11'd0;
-    mm_weight_wr_byte_en = 32'h0000_000f;
-    mm_weight_wr_en = 1'b1;
-    @(negedge clk);
-    mm_weight_wr_en = 1'b0;
-
-    mm_meta_in = make_meta(ROUTER_FLIT_HEAD, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
-                           3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                           1'b1, 5'd15, 10'd0, 8'h00);
-    mm_meta_in.payload_len = 6'd2;
-    mm_meta_in.psum_offset = 16'd2;
-    mm_flit_in = '0;
-    mm_flit_in[7:0] = 8'd16;
-    mm_flit_in[15:8] = 8'd16;
-    @(negedge clk);
-    mm_compute_fire = 1'b1;
-    @(negedge clk);
-    mm_compute_fire = 1'b0;
-
-    mm_meta_in = make_meta(ROUTER_FLIT_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
-                           3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                           1'b1, 5'd15, 10'd2, 8'h00);
-    mm_meta_in.payload_len = 6'd2;
-    mm_meta_in.psum_offset = 16'd2;
-    mm_flit_in = '0;
-    #1;
-    check(mm_active, "MatMul helper did not recognize MATMUL type5");
-    check(mm_flit_out[7:0] == 8'd48, "MatMul psum lane0 mismatch");
-    check(mm_flit_out[15:8] == 8'd112, "MatMul psum lane1 mismatch");
-
-    // Same-flit contract: if a flit carries both input lanes and the target
-    // psum lanes, the helper must use the current flit's multiply result for
-    // the writeback.  This covers head-tail packets and small synthetic layers.
-    @(negedge clk);
-    mm_release_state = 1'b1;
-    @(negedge clk);
-    mm_release_state = 1'b0;
-    mm_weight_row_size = 16'd2;
-    mm_meta_in = make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
-                           3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                           1'b1, 5'd15, 10'd0, 8'h00);
-    mm_meta_in.payload_len = 6'd4;
-    mm_meta_in.psum_offset = 16'd2;
-    mm_flit_in = '0;
-    mm_flit_in[7:0] = 8'd16;
-    mm_flit_in[15:8] = 8'd16;
-    @(negedge clk);
-    mm_compute_fire = 1'b1;
-    #1;
-    check(mm_flit_out[23:16] == 8'd48,
-          "MatMul same-flit psum lane0 did not observe current input chunk");
-    check(mm_flit_out[31:24] == 8'd112,
-          "MatMul same-flit psum lane1 did not observe current input chunk");
-    @(negedge clk);
-    mm_compute_fire = 1'b0;
-
-    // Off-flit contract: a router cannot write a packet-global psum entry unless
-    // the outgoing flit actually carries that byte.  The contribution is kept in
-    // router-local accumulator state and becomes visible only when the psum flit
-    // passes through the MFU.
-    @(negedge clk);
-    mm_release_state = 1'b1;
-    @(negedge clk);
-    mm_release_state = 1'b0;
-    mm_meta_in = make_meta(ROUTER_FLIT_HEAD, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
-                           3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                           1'b1, 5'd15, 10'd0, 8'h00);
-    mm_meta_in.payload_len = 6'd2;
-    mm_meta_in.psum_offset = 16'd4;
-    mm_flit_in = '0;
-    mm_flit_in[7:0] = 8'd16;
-    mm_flit_in[15:8] = 8'd16;
-    @(negedge clk);
-    mm_compute_fire = 1'b1;
-    #1;
-    check(mm_flit_out[7:0] == 8'd16,
-          "MatMul off-flit writeback corrupted input lane0");
-    check(mm_flit_out[15:8] == 8'd16,
-          "MatMul off-flit writeback corrupted input lane1");
-    check(mm_flit_out[39:32] == 8'd0,
-          "MatMul off-flit writeback updated psum lane before it was carried");
-    @(negedge clk);
-    mm_compute_fire = 1'b0;
-    mm_meta_in = make_meta(ROUTER_FLIT_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
-                           3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                           1'b1, 5'd15, 10'd4, 8'h00);
-    mm_meta_in.payload_len = 6'd0;
-    mm_meta_in.psum_offset = 16'd4;
-
-    // MatMul layout with an explicit non-zero data_offset.  This models the
-    // hardware address contract task_slot * row_size + data_offset + lane and
-    // guards against flattening every chunk to row base zero.
-    @(negedge clk);
-    mm_release_state = 1'b1;
-    @(negedge clk);
-    mm_release_state = 1'b0;
-    mm_weight_row_size = 16'd4;
-    mm_weight_wr_data = '0;
-    mm_weight_wr_data[7:0] = 8'd32;    // task0, input2 at address 2
-    mm_weight_wr_data[15:8] = 8'd32;   // task0, input3 at address 3
-    mm_weight_wr_addr = 11'd2;
-    mm_weight_wr_byte_en = 32'h0000_0003;
-    mm_weight_wr_en = 1'b1;
-    @(negedge clk);
-    mm_weight_wr_en = 1'b0;
-    mm_weight_wr_data = '0;
-    mm_weight_wr_data[7:0] = 8'd64;    // task1, input2 at address 6
-    mm_weight_wr_data[15:8] = 8'd64;   // task1, input3 at address 7
-    mm_weight_wr_addr = 11'd6;
-    mm_weight_wr_byte_en = 32'h0000_0003;
-    mm_weight_wr_en = 1'b1;
-    @(negedge clk);
-    mm_weight_wr_en = 1'b0;
-
-    mm_meta_in = make_meta(ROUTER_FLIT_HEAD, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
-                           3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                           1'b1, 5'd15, 10'd2, 8'h00);
-    mm_meta_in.payload_len = 6'd2;
-    mm_meta_in.psum_offset = 16'd4;
-    mm_flit_in = '0;
-    mm_flit_in[7:0] = 8'd16;
-    mm_flit_in[15:8] = 8'd16;
-    @(negedge clk);
-    mm_compute_fire = 1'b1;
-    @(negedge clk);
-    mm_compute_fire = 1'b0;
-
-    mm_meta_in = make_meta(ROUTER_FLIT_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
-                           3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                           1'b1, 5'd15, 10'd4, 8'h00);
-    mm_meta_in.payload_len = 6'd2;
-    mm_meta_in.psum_offset = 16'd4;
-    mm_flit_in = '0;
-    #1;
-    check(mm_flit_out[7:0] == 8'd64,
-          "MatMul non-zero data_offset psum lane0 mismatch");
-    check(mm_flit_out[15:8] == 8'd127,
-          "MatMul non-zero data_offset psum lane1 mismatch");
-    @(negedge clk);
-    mm_release_state = 1'b1;
-    @(negedge clk);
-    mm_release_state = 1'b0;
 
     // Attention helper: KV cache is loaded by type4-like writes, query lanes are
     // captured from type5 head/body payload, and tail updates psum lanes using
@@ -1792,7 +1595,11 @@ module router_unit_tb;
     att_meta_in.psum_offset = 16'd2;
     att_meta_in.k_dim = 16'd2;
     att_flit_in = '0;
+    @(negedge clk);
+    att_compute_fire = 1'b1;
+    @(posedge clk);
     #1;
+    check(att_valid, "Attention leaf did not assert valid on tail compute");
     // With one local token, the Q4.4 softmax weight is 1.0.  The functional
     // Attention helper therefore forwards the value vector [1.0, 2.0] into the
     // psum lanes and records running_max=2.0/running_sum=1.0 in header_reserved.
@@ -1802,6 +1609,7 @@ module router_unit_tb;
           "Attention running max sideband mismatch");
     check(att_meta_out.header_reserved[15:8] == 8'd16,
           "Attention running sum sideband mismatch");
+    att_compute_fire = 1'b0;
     @(negedge clk);
     att_release_state = 1'b1;
     @(negedge clk);

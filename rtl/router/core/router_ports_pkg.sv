@@ -49,6 +49,8 @@ package router_ports_pkg;
   localparam int VC_NUM = 8;
   localparam int CNOC_MAX_TASKS = 32;
   localparam int CNOC_TASK_ID_W = 16;
+  localparam int CNOC_SRAM_DATA_W = 64;
+  localparam int CNOC_SRAM_ADDR_W = 11;
 
   // Semantic field widths carried by flit_meta_t.  The 256-bit flit payload is
   // treated as data; routing/compute control lives in the hardware fields below,
@@ -115,6 +117,59 @@ package router_ports_pkg;
     router_flit_kind_e            flit_kind;
     logic                         valid;
   } flit_meta_t;
+
+  typedef struct packed {
+    logic start;
+    logic fetch_en;
+    logic compute_en;
+    logic state_release;
+  } mfu_alu_ctrl_t;
+
+  typedef struct packed {
+    logic [META_OPCODE_W-1:0] opcode;
+    router_msg_type_e         msg_type;
+    logic                     is_type5;
+    logic                     is_data_op;
+    logic                     is_attention;
+  } mfu_alu_op_t;
+
+  typedef struct packed {
+    logic [VC_ID_W-1:0] vc_id;
+    logic [2:0] out_sel;
+    logic [15:0] kv_token_count;
+    logic [5:0] task_count;
+    logic [CNOC_MAX_TASKS*CNOC_TASK_ID_W-1:0] task_ids_flat;
+    logic [15:0] weight_row_size;
+  } mfu_alu_ctx_t;
+
+  typedef struct packed {
+    logic valid;
+    logic bank_sel;
+    logic [CNOC_SRAM_ADDR_W-1:0] addr;
+  } mfu_alu_data_req_t;
+
+  typedef struct packed {
+    logic [CNOC_SRAM_DATA_W-1:0] rdata;
+  } mfu_alu_data_rsp_t;
+
+  typedef struct packed {
+    logic valid;
+    logic bank_sel;
+    logic [CNOC_SRAM_ADDR_W-1:0] addr;
+    logic [31:0] byte_en;
+    logic [FLIT_W-1:0] data;
+  } mfu_alu_data_wr_t;
+
+  typedef struct packed {
+    logic busy;
+    logic valid;
+    logic [FLIT_W-1:0] flit;
+    flit_meta_t meta;
+    logic signed [31:0] scalar;
+    logic attention_active;
+    logic [FLIT_W-1:0] attention_flit;
+    flit_meta_t attention_meta;
+  } mfu_alu_result_t;
 
   // Transitional alias for older code/comments.  New RTL should use
   // flit_meta_t so the type name reflects the NoC object it describes.

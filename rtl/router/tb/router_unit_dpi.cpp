@@ -47,7 +47,3 @@ extern "C" int dpi_div(int num_q, int den_q) {
   }
   return quantize(dequantize(num_q) / dequantize(den_q));
 }
-
-extern "C" int dpi_attention_mix(int q_q, int kv_q) {
-  return sat8(q_q + kv_q);
-}

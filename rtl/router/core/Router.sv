@@ -7,15 +7,7 @@
 module Router #(
     parameter integer VC_NUM = 8,
     parameter integer VC_ID_W = 3,
-    parameter integer FLIT_W = 256,
-    parameter integer MFU_LAT_LINEAR = 0,
-    parameter integer MFU_LAT_MATMUL = 0,
-    parameter integer MFU_LAT_ADD = 0,
-    parameter integer MFU_LAT_SWIGLU = 0,
-    parameter integer MFU_LAT_GEGLU = 0,
-    parameter integer MFU_LAT_ATTENTION = 8,
-    parameter integer MFU_LAT_DEFAULT = 0,
-    parameter integer MFU_LAT_TYPE4_STORE = 0
+    parameter integer FLIT_W = 256
 )(
     input logic [2:0] X_cur, Y_cur,
     input logic clk, reset,
@@ -44,8 +36,9 @@ module Router #(
     output router_ports_pkg::routport_data_t west_output_data,
     output router_ports_pkg::routport_data_t north_output_data,
     output router_ports_pkg::routport_data_t south_output_data,
-    output router_ports_pkg::routport_data_t local_output_data,
-
+    output router_ports_pkg::routport_data_t local_output_data
+`ifdef ROUTER_ENABLE_COSIM
+    ,
     // Debug outputs for cNoC state tracking.  
     output logic [31:0] cnoc_weight_bytes_stored,
     output logic [31:0] cnoc_kv_bytes_stored,
@@ -54,6 +47,7 @@ module Router #(
     output logic        cnoc_last_type4_store_bank,
     output logic [10:0] cnoc_last_type4_store_addr,
     output logic [5:0]  cnoc_last_type4_store_bytes
+`endif
 );
   import router_ports_pkg::*;
 
@@ -94,21 +88,14 @@ module Router #(
   logic [2:0] rinport_route_sel [NUM_PORTS];
   router_traffic_class_e rinport_traffic_class [NUM_PORTS];
   logic [NUM_PORTS-1:0] rinport_grant;
-  flit_meta_t iu_meta_filtered [NUM_PORTS];
   route_path_t rinport_route_path [NUM_PORTS];
 
   // -----------------------------------------
   // Input stage / crossbar datapath
   // -----------------------------------------
-  wire [FLIT_W-1:0] iu_flit_e, iu_flit_w, iu_flit_n, iu_flit_s, iu_flit_j;
-  flit_meta_t iu_meta_e, iu_meta_w, iu_meta_n, iu_meta_s, iu_meta_j;
-  wire [FLIT_W-1:0] xbar_flit_e, xbar_flit_w, xbar_flit_n, xbar_flit_s, xbar_flit_j;
-  flit_meta_t xbar_meta_e, xbar_meta_w, xbar_meta_n, xbar_meta_s, xbar_meta_j;
   logic [FLIT_W-1:0] xbar_flit [NUM_PORTS];
   flit_meta_t xbar_meta [NUM_PORTS];
   route_path_t xbar_route_path [NUM_PORTS];
-
-  logic [2:0] xbar_sel_e, xbar_sel_w, xbar_sel_n, xbar_sel_s, xbar_sel_j;
 
   // Router-owned downstream VC allocation is isolated in vc_allocator.
   logic [NUM_PORTS-1:0] vc_route_ready [NUM_PORTS];
@@ -186,6 +173,7 @@ module Router #(
 
   assign mfu_rinport_req = mfu_rinport_req_raw;
 
+`ifdef ROUTER_ENABLE_COSIM
 `ifdef RTL_DEBUG_MATMUL
   router_matmul_debug #(
       .NUM_PORTS(NUM_PORTS),
@@ -213,6 +201,7 @@ module Router #(
       .mfu_emit_meta_i(mfu_emit_meta),
       .mfu_emit_vc_id_i(mfu_emit_vc_id)
   );
+`endif
 `endif
 
   mfu_arbiter #(
@@ -318,46 +307,6 @@ module Router #(
     end
   endgenerate
 
-  assign iu_flit_e = rin_issue[PORT_SEL_EAST].flit;
-  assign iu_flit_w = rin_issue[PORT_SEL_WEST].flit;
-  assign iu_flit_n = rin_issue[PORT_SEL_NORTH].flit;
-  assign iu_flit_s = rin_issue[PORT_SEL_SOUTH].flit;
-  assign iu_flit_j = rin_issue[PORT_SEL_LOCAL].flit;
-
-  always_comb begin
-    for (integer filter_idx = 0; filter_idx < NUM_PORTS; filter_idx = filter_idx + 1) begin
-      iu_meta_filtered[filter_idx] = rin_issue[filter_idx].meta;
-    end
-  end
-
-  assign iu_meta_e = iu_meta_filtered[PORT_SEL_EAST];
-  assign iu_meta_w = iu_meta_filtered[PORT_SEL_WEST];
-  assign iu_meta_n = iu_meta_filtered[PORT_SEL_NORTH];
-  assign iu_meta_s = iu_meta_filtered[PORT_SEL_SOUTH];
-  assign iu_meta_j = iu_meta_filtered[PORT_SEL_LOCAL];
-
-  always @(*) begin
-    // Crossbar select is exactly the switch allocator winner for each output.
-    // A value of ROUTER_PORT_INV produces an idle raw_write below.
-    xbar_sel_e = routport_winner[PORT_SEL_EAST];
-    xbar_sel_w = routport_winner[PORT_SEL_WEST];
-    xbar_sel_n = routport_winner[PORT_SEL_NORTH];
-    xbar_sel_s = routport_winner[PORT_SEL_SOUTH];
-    xbar_sel_j = routport_winner[PORT_SEL_LOCAL];
-  end
-
-  assign xbar_flit[PORT_SEL_EAST] = xbar_flit_e;
-  assign xbar_flit[PORT_SEL_WEST] = xbar_flit_w;
-  assign xbar_flit[PORT_SEL_NORTH] = xbar_flit_n;
-  assign xbar_flit[PORT_SEL_SOUTH] = xbar_flit_s;
-  assign xbar_flit[PORT_SEL_LOCAL] = xbar_flit_j;
-
-  assign xbar_meta[PORT_SEL_EAST] = xbar_meta_e;
-  assign xbar_meta[PORT_SEL_WEST] = xbar_meta_w;
-  assign xbar_meta[PORT_SEL_NORTH] = xbar_meta_n;
-  assign xbar_meta[PORT_SEL_SOUTH] = xbar_meta_s;
-  assign xbar_meta[PORT_SEL_LOCAL] = xbar_meta_j;
-
   always_comb begin : proc_route_path_xbar
     for (int out_idx = 0; out_idx < NUM_PORTS; out_idx = out_idx + 1) begin
       xbar_route_path[out_idx] = '0;
@@ -383,15 +332,7 @@ module Router #(
       .NUM_PORTS(NUM_PORTS),
       .VC_NUM(VC_NUM),
       .VC_ID_W(VC_ID_W),
-      .FLIT_W(FLIT_W),
-      .MFU_LAT_LINEAR(MFU_LAT_LINEAR),
-      .MFU_LAT_MATMUL(MFU_LAT_MATMUL),
-      .MFU_LAT_ADD(MFU_LAT_ADD),
-      .MFU_LAT_SWIGLU(MFU_LAT_SWIGLU),
-      .MFU_LAT_GEGLU(MFU_LAT_GEGLU),
-      .MFU_LAT_ATTENTION(MFU_LAT_ATTENTION),
-      .MFU_LAT_DEFAULT(MFU_LAT_DEFAULT),
-      .MFU_LAT_TYPE4_STORE(MFU_LAT_TYPE4_STORE)
+      .FLIT_W(FLIT_W)
   ) cnoc_mfu_i (
       .clk(clk),
       .reset(reset),
@@ -413,7 +354,9 @@ module Router #(
       .emit_flit_o(mfu_emit_flit),
       .emit_meta_o(mfu_emit_meta),
       .emit_route_path_o(mfu_emit_route_path),
-      .emit_vc_id_o(mfu_emit_vc_id),
+      .emit_vc_id_o(mfu_emit_vc_id)
+`ifdef ROUTER_ENABLE_COSIM
+      ,
       .weight_bytes_stored_o(cnoc_weight_bytes_stored),
       .kv_bytes_stored_o(cnoc_kv_bytes_stored),
       .kv_token_count_o(cnoc_kv_token_count),
@@ -421,6 +364,7 @@ module Router #(
       .last_type4_store_bank_o(cnoc_last_type4_store_bank),
       .last_type4_store_addr_o(cnoc_last_type4_store_addr),
       .last_type4_store_bytes_o(cnoc_last_type4_store_bytes)
+`endif
   );
 
   router_output_stage #(
@@ -450,11 +394,31 @@ module Router #(
   );
   
   CrossBar #(.FLIT_W(FLIT_W)) X(
-    .OE(xbar_flit_e), .OW(xbar_flit_w), .ON(xbar_flit_n), .OS(xbar_flit_s), .Eject(xbar_flit_j),
-    .OE_META(xbar_meta_e), .OW_META(xbar_meta_w), .ON_META(xbar_meta_n), .OS_META(xbar_meta_s), .Eject_META(xbar_meta_j),
-    .S_E(xbar_sel_e), .S_W(xbar_sel_w), .S_N(xbar_sel_n), .S_S(xbar_sel_s), .S_Ejec(xbar_sel_j),
-    .IE(iu_flit_e), .IW(iu_flit_w), .IN(iu_flit_n), .IS(iu_flit_s), .Inject(iu_flit_j),
-    .IE_META(iu_meta_e), .IW_META(iu_meta_w), .IN_META(iu_meta_n), .IS_META(iu_meta_s), .Inject_META(iu_meta_j)
+    .OE(xbar_flit[PORT_SEL_EAST]),
+    .OW(xbar_flit[PORT_SEL_WEST]),
+    .ON(xbar_flit[PORT_SEL_NORTH]),
+    .OS(xbar_flit[PORT_SEL_SOUTH]),
+    .Eject(xbar_flit[PORT_SEL_LOCAL]),
+    .OE_META(xbar_meta[PORT_SEL_EAST]),
+    .OW_META(xbar_meta[PORT_SEL_WEST]),
+    .ON_META(xbar_meta[PORT_SEL_NORTH]),
+    .OS_META(xbar_meta[PORT_SEL_SOUTH]),
+    .Eject_META(xbar_meta[PORT_SEL_LOCAL]),
+    .S_E(routport_winner[PORT_SEL_EAST]),
+    .S_W(routport_winner[PORT_SEL_WEST]),
+    .S_N(routport_winner[PORT_SEL_NORTH]),
+    .S_S(routport_winner[PORT_SEL_SOUTH]),
+    .S_Ejec(routport_winner[PORT_SEL_LOCAL]),
+    .IE(rin_issue[PORT_SEL_EAST].flit),
+    .IW(rin_issue[PORT_SEL_WEST].flit),
+    .IN(rin_issue[PORT_SEL_NORTH].flit),
+    .IS(rin_issue[PORT_SEL_SOUTH].flit),
+    .Inject(rin_issue[PORT_SEL_LOCAL].flit),
+    .IE_META(rin_issue[PORT_SEL_EAST].meta),
+    .IW_META(rin_issue[PORT_SEL_WEST].meta),
+    .IN_META(rin_issue[PORT_SEL_NORTH].meta),
+    .IS_META(rin_issue[PORT_SEL_SOUTH].meta),
+    .Inject_META(rin_issue[PORT_SEL_LOCAL].meta)
   );
   
 endmodule

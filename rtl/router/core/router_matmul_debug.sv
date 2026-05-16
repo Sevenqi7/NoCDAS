@@ -1,7 +1,9 @@
 // Description: Optional MatMul/Linear tracepoints for router-level debugging.
-//              This module is instantiated only when RTL_DEBUG_MATMUL is set so
-//              the default Router datapath stays free of verbose debug prints.
+//              This module is compiled only for COSIM debug builds so the
+//              deliverable Router datapath stays free of verbose trace state.
 
+`ifdef ROUTER_ENABLE_COSIM
+`ifdef RTL_DEBUG_MATMUL
 module router_matmul_debug #(
     parameter int NUM_PORTS = router_ports_pkg::PORT_NUM,
     parameter int VC_ID_W = router_ports_pkg::VC_ID_W
@@ -44,29 +46,15 @@ module router_matmul_debug #(
 
   always_comb begin : proc_debug_ids
     for (int dbg_id_idx = 0; dbg_id_idx < NUM_PORTS; dbg_id_idx = dbg_id_idx + 1) begin
-`ifdef ROUTER_ENABLE_COSIM
       issue_packet_uid[dbg_id_idx] = rin_issue_i[dbg_id_idx].meta.cosim.packet_uid;
       issue_flit_id[dbg_id_idx] = rin_issue_i[dbg_id_idx].meta.cosim.flit_id;
       raw_packet_uid[dbg_id_idx] = raw_meta_i[dbg_id_idx].cosim.packet_uid;
       raw_flit_id[dbg_id_idx] = raw_meta_i[dbg_id_idx].cosim.flit_id;
-`else
-      issue_packet_uid[dbg_id_idx] = '0;
-      issue_flit_id[dbg_id_idx] = '0;
-      raw_packet_uid[dbg_id_idx] = '0;
-      raw_flit_id[dbg_id_idx] = '0;
-`endif
     end
-`ifdef ROUTER_ENABLE_COSIM
     active_packet_uid = active_flit_meta_i.cosim.packet_uid;
     active_flit_id = active_flit_meta_i.cosim.flit_id;
     emit_packet_uid = mfu_emit_meta_i.cosim.packet_uid;
     emit_flit_id = mfu_emit_meta_i.cosim.flit_id;
-`else
-    active_packet_uid = '0;
-    active_flit_id = '0;
-    emit_packet_uid = '0;
-    emit_flit_id = '0;
-`endif
   end
 
   always_ff @(posedge clk_i) begin
@@ -158,3 +146,5 @@ module router_matmul_debug #(
   end
 
 endmodule
+`endif
+`endif
