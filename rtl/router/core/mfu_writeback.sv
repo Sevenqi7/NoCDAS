@@ -1,9 +1,9 @@
 // Copyright (c) 2026
 //
 // Description: MFU writeback formatting.
-//              Chooses between the latency-aware ALU payload, the Attention
-//              payload, or the original type4 passthrough payload.  All
-//              arithmetic is completed before this module observes the data.
+//              Chooses between the latency-aware ALU payload or the original
+//              type4 passthrough payload.  All arithmetic is completed before
+//              this module observes the data.
 
 module mfu_writeback #(
     parameter int FLIT_W = router_ports_pkg::FLIT_W
@@ -13,9 +13,6 @@ module mfu_writeback #(
     input  logic             pkt_is_type5_i,
     input  logic [FLIT_W-1:0] alu_flit_i,
     input  router_ports_pkg::flit_meta_t alu_meta_i,
-    input  logic             attention_active_i,
-    input  logic [FLIT_W-1:0] attention_flit_i,
-    input  router_ports_pkg::flit_meta_t attention_meta_i,
     output logic [FLIT_W-1:0] emit_flit_o,
     output router_ports_pkg::flit_meta_t emit_meta_o
 );
@@ -69,13 +66,10 @@ module mfu_writeback #(
 `endif
         end
         OP_ATTENTION: begin
-          // Attention owns a separate control path because it consumes query
-          // state and the local KV cache.  The arithmetic is functional, but the
-          // flit update still comes from RTL-owned storage/state.
-          if (attention_active_i) begin
-            emit_flit_o = attention_flit_i;
-            emit_meta_o = attention_meta_i;
-          end
+          // Attention is now a normal ALU leaf result.  Its stateful SRAM
+          // streaming path completes before writeback observes alu_*.
+          emit_flit_o = alu_flit_i;
+          emit_meta_o = alu_meta_i;
 `ifdef ROUTER_ENABLE_COSIM
           emit_meta_o.cosim.data_q = emit_flit_o[{data_lane, 3'b000} +: 8];
 `endif

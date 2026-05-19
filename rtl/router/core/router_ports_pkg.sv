@@ -153,22 +153,11 @@ package router_ports_pkg;
   } mfu_alu_data_rsp_t;
 
   typedef struct packed {
-    logic valid;
-    logic bank_sel;
-    logic [CNOC_SRAM_ADDR_W-1:0] addr;
-    logic [31:0] byte_en;
-    logic [FLIT_W-1:0] data;
-  } mfu_alu_data_wr_t;
-
-  typedef struct packed {
     logic busy;
     logic valid;
     logic [FLIT_W-1:0] flit;
     flit_meta_t meta;
     logic signed [31:0] scalar;
-    logic attention_active;
-    logic [FLIT_W-1:0] attention_flit;
-    flit_meta_t attention_meta;
   } mfu_alu_result_t;
 
   // Transitional alias for older code/comments.  New RTL should use
@@ -204,12 +193,12 @@ package router_ports_pkg;
 
   // Pure combinational predicates.  These helpers intentionally stay tiny:
   // enum in, one boolean expression out, no state, no route/VC/MFU policy.
-  function logic flit_is_head_like(input router_flit_kind_e flit_kind);
+  function automatic logic flit_is_head_like(input router_flit_kind_e flit_kind);
     flit_is_head_like = (flit_kind == ROUTER_FLIT_HEAD) ||
                         (flit_kind == ROUTER_FLIT_HEAD_TAIL);
   endfunction
 
-  function logic flit_is_tail_like(input router_flit_kind_e flit_kind);
+  function automatic logic flit_is_tail_like(input router_flit_kind_e flit_kind);
     flit_is_tail_like = (flit_kind == ROUTER_FLIT_TAIL) ||
                         (flit_kind == ROUTER_FLIT_HEAD_TAIL);
   endfunction

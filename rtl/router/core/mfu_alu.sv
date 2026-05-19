@@ -21,7 +21,6 @@ module mfu_alu #(
     input  logic [FLIT_W-1:0] flit_i,
     input  router_ports_pkg::flit_meta_t meta_i,
     input  router_ports_pkg::mfu_alu_ctx_t ctx_i,
-    input  router_ports_pkg::mfu_alu_data_wr_t data_wr_i,
     input  router_ports_pkg::mfu_alu_data_rsp_t data_rsp_i,
     output router_ports_pkg::mfu_alu_data_req_t data_req_o,
     output router_ports_pkg::mfu_alu_result_t result_o
@@ -35,12 +34,13 @@ module mfu_alu #(
 
   logic signed [31:0] scalar_a;
   logic signed [31:0] scalar_b;
+  mfu_alu_data_req_t matmul_data_req;
+  mfu_alu_data_req_t attention_data_req;
 
   logic add_start;
   logic swiglu_start;
   logic geglu_start;
   logic default_start;
-  logic attention_start;
 
   logic add_busy;
   logic add_valid;
@@ -74,9 +74,8 @@ module mfu_alu #(
 
   logic attention_busy;
   logic attention_valid;
-  logic attention_active;
-  logic [FLIT_W-1:0] attention_flit;
-  flit_meta_t attention_meta;
+  logic [FLIT_W-1:0] attention_result_flit;
+  flit_meta_t attention_result_meta;
 
   logic [FLIT_W-1:0] result_flit_comb;
   flit_meta_t result_meta_comb;
@@ -98,8 +97,6 @@ module mfu_alu #(
                          (op_i.opcode != OP_ADD) &&
                          (op_i.opcode != OP_SWIGLU) &&
                          (op_i.opcode != OP_GEGLU);
-  assign attention_start = ctrl_i.start && op_i.is_attention;
-
   mfu_alu_matmul #(
       .NUM_PORTS(NUM_PORTS),
       .VC_NUM(VC_NUM),
@@ -121,7 +118,7 @@ module mfu_alu #(
       .pkt_meta_i(meta_i),
       .ctx_i(ctx_i),
       .data_rsp_i(data_rsp_i),
-      .data_req_o(data_req_o),
+      .data_req_o(matmul_data_req),
       .busy_o(matmul_busy),
       .result_valid_o(matmul_valid),
       .result_flit_o(matmul_flit),
@@ -186,22 +183,24 @@ module mfu_alu #(
       .VC_ID_W(VC_ID_W),
       .FLIT_W(FLIT_W),
       .SRAM_DEPTH(SRAM_DEPTH),
-      .SRAM_ADDR_W(SRAM_ADDR_W)
+      .SRAM_ADDR_W(SRAM_ADDR_W),
+      .DATA_W(DATA_W)
   ) attention_i (
-      .clk(clk_i),
-      .reset(reset_i),
+      .clk_i(clk_i),
+      .reset_i(reset_i),
+      .fetch_en_i(ctrl_i.fetch_en),
+      .compute_en_i(ctrl_i.compute_en),
       .op_i(op_i),
-      .data_wr_i(data_wr_i),
       .ctx_i(ctx_i),
-      .start_i(attention_start),
       .release_state_i(ctrl_i.state_release),
       .pkt_flit_i(flit_i),
       .pkt_meta_i(meta_i),
+      .data_rsp_i(data_rsp_i),
+      .data_req_o(attention_data_req),
       .busy_o(attention_busy),
-      .valid_o(attention_valid),
-      .attention_active_o(attention_active),
-      .attention_flit_o(attention_flit),
-      .attention_meta_o(attention_meta)
+      .result_valid_o(attention_valid),
+      .result_flit_o(attention_result_flit),
+      .result_meta_o(attention_result_meta)
   );
 
   mfu_alu_default #(
@@ -235,8 +234,8 @@ module mfu_alu #(
       result_scalar_comb = matmul_scalar;
       result_valid_comb = matmul_valid;
     end else if (op_i.is_attention) begin
-      result_flit_comb = attention_flit;
-      result_meta_comb = attention_meta;
+      result_flit_comb = attention_result_flit;
+      result_meta_comb = attention_result_meta;
       result_scalar_comb = 32'sd0;
       result_valid_comb = attention_valid;
     end else begin
@@ -274,8 +273,14 @@ module mfu_alu #(
   assign result_o.flit = result_flit_comb;
   assign result_o.meta = result_meta_comb;
   assign result_o.scalar = result_scalar_comb;
-  assign result_o.attention_active = attention_active;
-  assign result_o.attention_flit = attention_flit;
-  assign result_o.attention_meta = attention_meta;
+
+  always_comb begin : proc_data_request_mux
+    data_req_o = '0;
+    if (op_i.is_data_op) begin
+      data_req_o = matmul_data_req;
+    end else if (op_i.is_attention) begin
+      data_req_o = attention_data_req;
+    end
+  end
 
 endmodule

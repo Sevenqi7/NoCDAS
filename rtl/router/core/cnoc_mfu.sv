@@ -111,8 +111,11 @@ module cnoc_mfu #(
   logic [15:0] type4_kv_max_tokens_safe;
   logic [15:0] type4_kv_sink_limit;
   logic [31:0] type4_kv_max_tokens_full;
-  logic [15:0] type4_kv_ring_span;
+  logic [15:0] type4_kv_slot_q;
+  logic [15:0] type4_kv_slot_next;
   logic [15:0] type4_kv_slot;
+  logic [15:0] type4_kv_last_slot;
+  logic type4_kv_has_ring_region;
   logic [31:0] type4_wr_addr_full;
   logic [5:0] type4_payload_bytes;
   logic [31:0] type4_bytes_to_sram_end_full;
@@ -127,7 +130,6 @@ module cnoc_mfu #(
   logic [SRAM_ADDR_W-1:0] mfu_sram_if_rd_addr;
   mfu_alu_ctrl_t alu_ctrl;
   mfu_alu_ctx_t alu_ctx;
-  mfu_alu_data_wr_t alu_data_wr;
   mfu_alu_data_rsp_t alu_data_rsp;
   mfu_alu_data_req_t alu_data_req;
   mfu_alu_op_t alu_op;
@@ -174,19 +176,26 @@ module cnoc_mfu #(
         (type4_kv_max_tokens_safe > TYPE4_KV_SINK_TOKENS_Q) ?
         TYPE4_KV_SINK_TOKENS_Q :
         type4_kv_max_tokens_safe;
-    type4_kv_ring_span =
-        (type4_kv_max_tokens_safe > type4_kv_sink_limit) ?
-        (type4_kv_max_tokens_safe - type4_kv_sink_limit) :
-        16'd1;
+    type4_kv_last_slot = type4_kv_max_tokens_safe - 16'd1;
+    type4_kv_has_ring_region = type4_kv_max_tokens_safe > type4_kv_sink_limit;
 
-    if (type4_kv_token_count_q < type4_kv_sink_limit) begin
-      type4_kv_slot = type4_kv_token_count_q;
-    end else if (type4_kv_max_tokens_safe > type4_kv_sink_limit) begin
-      type4_kv_slot =
-          type4_kv_sink_limit +
-          ((type4_kv_token_count_q - type4_kv_sink_limit) % type4_kv_ring_span);
+    if (type4_kv_slot_q < type4_kv_max_tokens_safe) begin
+      type4_kv_slot = type4_kv_slot_q;
     end else begin
-      type4_kv_slot = type4_kv_max_tokens_safe - 16'd1;
+      type4_kv_slot = type4_kv_last_slot;
+    end
+
+    type4_kv_slot_next = type4_kv_slot;
+    if (!type4_kv_has_ring_region) begin
+      type4_kv_slot_next = type4_kv_last_slot;
+    end else if ((type4_kv_slot + 16'd1) < type4_kv_sink_limit) begin
+      type4_kv_slot_next = type4_kv_slot + 16'd1;
+    end else if (type4_kv_slot < type4_kv_sink_limit) begin
+      type4_kv_slot_next = type4_kv_sink_limit;
+    end else if ((type4_kv_slot + 16'd1) < type4_kv_max_tokens_safe) begin
+      type4_kv_slot_next = type4_kv_slot + 16'd1;
+    end else begin
+      type4_kv_slot_next = type4_kv_sink_limit;
     end
 
     if (type4_bank_sel) begin
@@ -248,11 +257,6 @@ module cnoc_mfu #(
   assign alu_ctx.task_count = cnoc_task_count_i;
   assign alu_ctx.task_ids_flat = cnoc_task_ids_flat_i;
   assign alu_ctx.weight_row_size = cnoc_weight_row_size_i;
-  assign alu_data_wr.valid = sram_wr_en;
-  assign alu_data_wr.bank_sel = sram_wr_bank_sel;
-  assign alu_data_wr.addr = sram_wr_addr;
-  assign alu_data_wr.byte_en = sram_wr_byte_en;
-  assign alu_data_wr.data = sram_wr_data;
   assign alu_data_rsp.rdata = sram_rdata;
 
 `ifdef ROUTER_ENABLE_COSIM
@@ -283,6 +287,7 @@ module cnoc_mfu #(
       decoded_is_type5_q <= 1'b0;
       decoded_tail_like_q <= 1'b0;
       type4_kv_token_count_q <= 16'd0;
+      type4_kv_slot_q <= 16'd0;
 `ifdef ROUTER_ENABLE_COSIM
       weight_bytes_stored_q <= 32'd0;
       kv_bytes_stored_q <= 32'd0;
@@ -345,6 +350,7 @@ module cnoc_mfu #(
         if (decoded_is_type4_q && decoded_opcode_q == OPCODE_ATTENTION &&
             decoded_tail_like_q) begin
           type4_kv_token_count_q <= type4_kv_token_count_q + 16'd1;
+          type4_kv_slot_q <= type4_kv_slot_next;
         end
         // The one-entry MFU pipeline is now free to capture the next cNoC flit.
         pkt_valid_q <= 1'b0;
@@ -421,9 +427,6 @@ module cnoc_mfu #(
       .pkt_is_type5_i(decoded_is_type5_q),
       .alu_flit_i(alu_result.flit),
       .alu_meta_i(alu_result.meta),
-      .attention_active_i(alu_result.attention_active),
-      .attention_flit_i(alu_result.attention_flit),
-      .attention_meta_i(alu_result.attention_meta),
       .emit_flit_o(writeback_flit),
       .emit_meta_o(emit_meta_o)
   );
@@ -446,7 +449,6 @@ module cnoc_mfu #(
       .flit_i(pkt_flit_q),
       .meta_i(pkt_meta_q),
       .ctx_i(alu_ctx),
-      .data_wr_i(alu_data_wr),
       .data_rsp_i(alu_data_rsp),
       .data_req_o(alu_data_req),
       .result_o(alu_result)
