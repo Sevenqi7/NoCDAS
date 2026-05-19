@@ -364,7 +364,8 @@ void MACnet::cNoC_mapping(int task_num) {
 
     for (int i = 0; i < TOT_NUM; i++) {
         this->vcNetwork->router_list[i]->clearSRAM();
-        if (this->vcNetwork->router_list[i]->rtl_router != nullptr) {
+        if (this->vcNetwork->router_list[i]->rtl_router != nullptr &&
+            this->vcNetwork->router_list[i]->rtl_router->ownsCnocMfu()) {
             cnoc_rtl_weight_baseline[i] =
                 this->vcNetwork->router_list[i]->rtl_router->cnocWeightBytesStored();
             cnoc_rtl_kv_baseline[i] =
@@ -483,7 +484,7 @@ bool MACnet::cnoc_distribution_ready() const {
             continue;
         }
 
-        if (router->rtl_router != nullptr) {
+        if (router->rtl_router != nullptr && router->rtl_router->ownsCnocMfu()) {
             const unsigned int expected = static_cast<unsigned int>(expected_payload);
             if (o_fn == ATTENTION) {
                 const unsigned int kv_delta =
@@ -638,7 +639,11 @@ void MACnet::inject_cNoC_traffic() {
 
                 if (o_fn == 18) {
                     int residual_source_id = this->cnnmodel->all_layer_size[c_layer][1];
-                    if (layer_outputs_history.find(residual_source_id) != layer_outputs_history.end() && !layer_outputs_history[residual_source_id].empty()) {
+                    if (layer_outputs_history.find(residual_source_id) == layer_outputs_history.end()) {
+                        residual_source_id = (c_layer > 0) ? (c_layer - 1) : 0;
+                    }
+                    if (layer_outputs_history.find(residual_source_id) != layer_outputs_history.end() &&
+                        !layer_outputs_history[residual_source_id].empty()) {
                         secondary_data = layer_outputs_history[residual_source_id][0];
                         has_residual = true;
                     }
@@ -647,12 +652,28 @@ void MACnet::inject_cNoC_traffic() {
                 for (int k = 0; k < this->tasks_in_current_chunk; k++) {
                     int base_idx = y * this->in_x + this->chunk_start_task_idx + k;
 
-                    comp_msg.data.push_back(this->input_table[0][base_idx]);
+                    if (this->input_table.size() > 0 &&
+                        base_idx >= 0 &&
+                        base_idx < static_cast<int>(this->input_table[0].size())) {
+                        comp_msg.data.push_back(this->input_table[0][base_idx]);
+                    } else {
+                        comp_msg.data.push_back(0.0f);
+                    }
 
-                    if (o_fn == 18 && has_residual) {
+                    if (o_fn == 18 &&
+                        has_residual &&
+                        base_idx >= 0 &&
+                        base_idx < static_cast<int>(secondary_data.size())) {
                         comp_msg.data.push_back(secondary_data[base_idx]);
                     } else if (o_fn == 21 || o_fn == 24) {
-                        comp_msg.data.push_back(this->input_table[0][base_idx + o_x]);
+                        int pair_idx = base_idx + o_x;
+                        if (this->input_table.size() > 0 &&
+                            pair_idx >= 0 &&
+                            pair_idx < static_cast<int>(this->input_table[0].size())) {
+                            comp_msg.data.push_back(this->input_table[0][pair_idx]);
+                        } else {
+                            comp_msg.data.push_back(0.0f);
+                        }
                     } else {
                         comp_msg.data.push_back(0.0f);
                     }

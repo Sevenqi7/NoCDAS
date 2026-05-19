@@ -80,7 +80,11 @@ int main(int arg_num, char *arg_vet[]) {
 		TraceLogger::instance().enable("trace.log");
 	}
 	if (GlobalParams::enable_rtl_router) {
-		cout << "Verilated RTL Router backend enabled (RTL-owned cNoC path)" << endl;
+#if ENABLE_CNOC_MFU
+		cout << "Verilated RTL Router backend enabled (RTL-owned cNoC/MFU path)" << endl;
+#else
+		cout << "Verilated RTL Router backend enabled (cNoC/MFU handled by C++ model)" << endl;
+#endif
 	}
 
 	chrono::steady_clock::time_point begin = chrono::steady_clock::now();

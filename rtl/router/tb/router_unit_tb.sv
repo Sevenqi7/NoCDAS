@@ -165,9 +165,16 @@ module router_unit_tb;
       end
       check(iu_issue.valid, {label, ": input unit did not issue"});
       check(iu_issue.route_sel == expected_route, {label, ": unexpected route_sel"});
-      iu_ctrl.vc_grant = 1'b1;
+      iu_ctrl.issue_accept = 1'b1;
       @(negedge clk);
-      iu_ctrl.vc_grant = 1'b0;
+      iu_ctrl.issue_accept = 1'b0;
+      iu_ctrl.commit_valid = 1'b1;
+      iu_ctrl.commit_vc = iu_issue.sel_vc;
+      iu_ctrl.commit_tail_like = flit_is_tail_like(iu_issue.meta.flit_kind);
+      @(negedge clk);
+      iu_ctrl.commit_valid = 1'b0;
+      iu_ctrl.commit_vc = '0;
+      iu_ctrl.commit_tail_like = 1'b0;
     end
   endtask
 
@@ -334,7 +341,6 @@ module router_unit_tb;
   assign alu_wrap_ctrl.fetch_en = 1'b0;
   assign alu_wrap_ctrl.compute_en = 1'b0;
   assign alu_wrap_ctrl.state_release = 1'b0;
-  assign alu_wrap_ctx = '0;
   assign alu_wrap_data_rsp = '0;
   assign alu_wrap_op.opcode = alu_wrap_meta_in.opcode;
   assign alu_wrap_op.msg_type = alu_wrap_meta_in.msg_type;
@@ -399,6 +405,7 @@ module router_unit_tb;
       .start_i(alu_leaf_start),
       .flit_i(alu_leaf_flit_in),
       .meta_i(alu_leaf_meta_in),
+      .ctx_i(alu_wrap_ctx),
       .scalar_a_i(alu_leaf_op_a),
       .scalar_b_i(alu_leaf_op_b),
       .busy_o(alu_add_busy),
@@ -416,6 +423,7 @@ module router_unit_tb;
       .start_i(alu_leaf_start),
       .flit_i(alu_leaf_flit_in),
       .meta_i(alu_leaf_meta_in),
+      .ctx_i(alu_wrap_ctx),
       .scalar_a_i(alu_leaf_op_a),
       .scalar_b_i(alu_leaf_op_b),
       .busy_o(alu_swiglu_busy),
@@ -433,6 +441,7 @@ module router_unit_tb;
       .start_i(alu_leaf_start),
       .flit_i(alu_leaf_flit_in),
       .meta_i(alu_leaf_meta_in),
+      .ctx_i(alu_wrap_ctx),
       .scalar_a_i(alu_leaf_op_a),
       .scalar_b_i(alu_leaf_op_b),
       .busy_o(alu_geglu_busy),
@@ -478,6 +487,8 @@ module router_unit_tb;
   integer att_read_idx;
   integer att_task_init_idx;
 
+  assign att_ctx.stream_port = ROUTER_PORT_LOCAL;
+  assign att_ctx.stream_vc = 3'd0;
   assign att_ctx.vc_id = 3'd0;
   assign att_ctx.out_sel = ROUTER_PORT_LOCAL;
   assign att_ctx.kv_token_count = 16'd1;
@@ -571,9 +582,11 @@ module router_unit_tb;
       .Y_cur(3'd1),
       .clk(clk),
       .reset(reset),
+`ifdef ENABLE_CNOC_MFU
       .cnoc_task_count(6'd2),
       .cnoc_task_ids_flat(top_task_ids_flat),
       .cnoc_weight_row_size(16'd2),
+`endif
       .east_input_data(top_east_input_data),
       .west_input_data(top_west_input_data),
       .north_input_data(top_north_input_data),
@@ -854,7 +867,7 @@ module router_unit_tb;
             end
           end
           if (!matched) begin
-            $display("[TB][DEBUG] stress unexpected output time=%0t port=%0d flit=%h expected_count=%0d",
+            $display("[TB][FAIL] stress unexpected output time=%0t port=%0d flit=%h expected_count=%0d",
                      $time, port_idx, top_output_flit(port_sel), expected_count);
           end
           check(matched, "stress scoreboard observed duplicate or unexpected output flit");
@@ -974,7 +987,7 @@ module router_unit_tb;
           top_stress_observe_outputs(seen, expected, flit_idx + 1);
         end
         if (!seen[flit_idx]) begin
-          $display("[TB][DEBUG] stress missing flit_idx=%0d src_port=%0d dst_port=%0d stall_port=%0d vc_id=%0d expected=%h",
+          $display("[TB][FAIL] stress missing flit_idx=%0d src_port=%0d dst_port=%0d stall_port=%0d vc_id=%0d expected=%h",
                    flit_idx, src_port_raw, dst_port_raw, stall_port_raw,
                    vc_id, expected[flit_idx]);
         end
@@ -1022,6 +1035,14 @@ module router_unit_tb;
     alu_wrap_start = 1'b0;
     alu_wrap_flit_in = '0;
     alu_wrap_meta_in = '0;
+    alu_wrap_ctx = '0;
+    alu_wrap_ctx.stream_port = ROUTER_PORT_LOCAL;
+    alu_wrap_ctx.stream_vc = 3'd0;
+    alu_wrap_ctx.vc_id = 3'd0;
+    alu_wrap_ctx.out_sel = ROUTER_PORT_LOCAL;
+    alu_wrap_ctx.task_count = 6'd2;
+    alu_wrap_ctx.task_ids_flat[0 +: CNOC_TASK_ID_W] = 16'd0;
+    alu_wrap_ctx.task_ids_flat[CNOC_TASK_ID_W +: CNOC_TASK_ID_W] = 16'd1;
     alu_leaf_flit_in = '0;
     alu_leaf_meta_in = '0;
     alu_leaf_op_a = '0;
@@ -1089,21 +1110,34 @@ module router_unit_tb;
     iu_revisit_route_path.route_process_seq[4] = 1'b0;
     iu_push_with_route(iu_revisit_meta, iu_revisit_route_path, 3'd0);
     while (!iu_issue.valid) @(negedge clk);
-    check(iu_issue.route_sel == ROUTER_PORT_EAST,
-          "source-route revisit test did not use current route pointer");
-    check(iu_issue.meta.process == 1'b0,
-          "input_unit did not apply source-route process mask on revisit");
-    check(!iu_may_need_mfu,
-          "input_unit should not request MFU when current source-route hop process bit is clear");
-    iu_ctrl.vc_grant = 1'b1;
+	    check(iu_issue.route_sel == ROUTER_PORT_EAST,
+	          "source-route revisit test did not use current route pointer");
+`ifdef ENABLE_CNOC_MFU
+	    check(iu_issue.meta.process == 1'b0,
+	          "input_unit did not apply source-route process mask on revisit");
+	    check(!iu_may_need_mfu,
+	          "input_unit should not request MFU when current source-route hop process bit is clear");
+`else
+	    check(!iu_may_need_mfu,
+	          "input_unit should not request MFU when ENABLE_CNOC_MFU is disabled");
+`endif
+    iu_ctrl.issue_accept = 1'b1;
     @(negedge clk);
-    iu_ctrl.vc_grant = 1'b0;
+    iu_ctrl.issue_accept = 1'b0;
+    iu_ctrl.commit_valid = 1'b1;
+    iu_ctrl.commit_vc = iu_issue.sel_vc;
+    iu_ctrl.commit_tail_like = flit_is_tail_like(iu_issue.meta.flit_kind);
+    @(negedge clk);
+    iu_ctrl.commit_valid = 1'b0;
+    iu_ctrl.commit_vc = '0;
+    iu_ctrl.commit_tail_like = 1'b0;
 
     end
   endtask
 
   task automatic run_router_process_mask_tests();
     begin
+`ifdef ENABLE_CNOC_MFU
     // Source-route process mask: the first hop has process=1 and enters the
     // MFU; a later hop for the same flit identity has process=0 and bypasses
     // MFU.  This replaces the old router-local processed-flit table.
@@ -1114,6 +1148,9 @@ module router_unit_tb;
     top_dup_flit[15:8] = 8'd16;
     top_dup_processed_flit = top_dup_flit;
     top_dup_processed_flit[7:0] = 8'd32;
+    top_task_ids_flat = '0;
+    top_task_ids_flat[0 +: CNOC_TASK_ID_W] = 16'd6;
+    top_task_ids_flat[CNOC_TASK_ID_W +: CNOC_TASK_ID_W] = 16'd7;
     top_dup_meta =
         make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                   3'd2, 3'd1, 1'b1, 8'd2, 8'd0, ROUTER_PORT_EAST,
@@ -1169,7 +1206,37 @@ module router_unit_tb;
                               1'b0,
                               "source-route process-mask revisit bypass");
 
-    end
+`else
+	    top_clear_inputs();
+	    top_ready_all_outputs();
+	    top_dup_flit = '0;
+	    top_dup_flit[7:0] = 8'd16;
+	    top_dup_flit[15:8] = 8'd16;
+	    top_dup_meta =
+	        make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
+	                  3'd2, 3'd1, 1'b1, 8'd2, 8'd0, ROUTER_PORT_EAST,
+	                  1'b1, 5'd18, 10'd12, 8'h10);
+	    top_dup_meta.payload_len = 6'd2;
+	    top_dup_route_path =
+	        make_route_path(1'b1, 8'd2, 8'd0, ROUTER_PORT_EAST, 1'b1);
+	    top_drive_input_with_route(ROUTER_PORT_LOCAL,
+	                               top_dup_flit,
+	                               top_dup_meta,
+	                               top_dup_route_path,
+	                               3'd0,
+	                               1'b1);
+	    #1;
+	    check(top_input_ack(ROUTER_PORT_LOCAL, 3'd0),
+	          "source-route no-MFU flit was not accepted");
+	    @(posedge clk);
+	    #1;
+	    top_clear_inputs();
+	    top_expect_output_process(ROUTER_PORT_EAST,
+	                              top_dup_flit,
+	                              1'b1,
+	                              "source-route no-MFU forwarding");
+`endif
+	    end
   endtask
 
   task automatic run_input_unit_context_tests();
@@ -1224,11 +1291,12 @@ module router_unit_tb;
     sw_class[1] = ROUTER_TRAFFIC_DIST;
     sw_class[2] = ROUTER_TRAFFIC_COMP;
     #1;
-    check(sw_winner[ROUTER_PORT_EAST] == 3'd2, "QoS did not prioritize type5");
+	    check(sw_winner[ROUTER_PORT_EAST] == 3'd2, "QoS did not prioritize type5");
 
-    // MFU busy blocks an MFU-bound candidate from bypassing.
-    sw_mfu_req = '0;
-    sw_mfu_req[2] = 1'b1;
+`ifdef ENABLE_CNOC_MFU
+	    // MFU busy blocks an MFU-bound candidate from bypassing.
+	    sw_mfu_req = '0;
+	    sw_mfu_req[2] = 1'b1;
     sw_mfu_busy = 1'b1;
     #1;
     check(sw_winner[ROUTER_PORT_EAST] == 3'd1, "MFU busy did not block type5 MFU candidate");
@@ -1259,11 +1327,12 @@ module router_unit_tb;
     sw_class[1] = ROUTER_TRAFFIC_COMP;
     sw_mfu_req[0] = 1'b1;
     sw_mfu_req[1] = 1'b1;
-    #1;
-    check((sw_grant[0] ^ sw_grant[1]) == 1'b1,
-          "switch allocator granted more than one MFU-bound input");
+	    #1;
+	    check((sw_grant[0] ^ sw_grant[1]) == 1'b1,
+	          "switch allocator granted more than one MFU-bound input");
+`endif
 
-    // Starvation guard: after two LCS grants with a regular request waiting,
+	    // Starvation guard: after two LCS grants with a regular request waiting,
     // the regular request is forced through.
     clear_switch_inputs();
     sw_req[0] = 1'b1;
@@ -1294,15 +1363,24 @@ module router_unit_tb;
     #1;
     check(vca_dst_vc[ROUTER_PORT_EAST] == 3'd1, "VC allocator regular RR did not advance to VC1");
 
-    vca_meta[ROUTER_PORT_LOCAL] =
-        make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
-                  3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                  1'b1, 5'd15, 10'd0, 8'h00);
-    #1;
-    check(vca_dst_vc[ROUTER_PORT_EAST] == 3'd4, "VC allocator cNoC first grant was not LCS VC4");
-    @(posedge clk);
-    #1;
-    check(vca_dst_vc[ROUTER_PORT_EAST] == 3'd5, "VC allocator cNoC RR did not advance to VC5");
+	    vca_meta[ROUTER_PORT_LOCAL] =
+	        make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
+	                  3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
+	                  1'b1, 5'd15, 10'd0, 8'h00);
+	    #1;
+`ifdef ENABLE_CNOC_MFU
+	    check(vca_dst_vc[ROUTER_PORT_EAST] == 3'd4, "VC allocator cNoC first grant was not LCS VC4");
+	    @(posedge clk);
+	    #1;
+	    check(vca_dst_vc[ROUTER_PORT_EAST] == 3'd5, "VC allocator cNoC RR did not advance to VC5");
+`else
+	    check(vca_dst_vc[ROUTER_PORT_EAST] == 3'd4,
+	          "VC allocator no-MFU QoS traffic did not use header-selected vnet1");
+	    @(posedge clk);
+	    #1;
+	    check(vca_dst_vc[ROUTER_PORT_EAST] == 3'd5,
+	          "VC allocator no-MFU QoS traffic did not stay in header-selected vnet");
+`endif
 
     // Negative VC allocation: no idle VC means a head cannot transfer.
     vca_flow[ROUTER_PORT_EAST].downstream_vc_idle_mask = '0;
@@ -1509,6 +1587,7 @@ module router_unit_tb;
     @(negedge clk);
 
     alu_leaf_meta_in.opcode = 5'd21;
+    alu_leaf_meta_in.payload_len = 6'd2;
     alu_leaf_flit_in = '0;
     alu_leaf_flit_in[7:0] = 8'd0;
     alu_leaf_flit_in[15:8] = 8'd8;
@@ -1523,6 +1602,7 @@ module router_unit_tb;
     @(negedge clk);
 
     alu_leaf_meta_in.opcode = 5'd24;
+    alu_leaf_meta_in.payload_len = 6'd2;
     @(negedge clk);
     alu_leaf_start = 1'b1;
     @(posedge clk);

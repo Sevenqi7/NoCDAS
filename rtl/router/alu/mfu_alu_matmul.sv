@@ -314,12 +314,12 @@ module mfu_alu_matmul #(
         task_idx_q <= 5'd0;
         data_sum_q <= '0;
         weight_data_q <= data_rsp_i.rdata;
-        task_base_q <= head_like ? '0 : accum_q[ctx_i.out_sel][ctx_i.vc_id][0];
+        task_base_q <= head_like ? '0 : accum_q[ctx_i.stream_port][ctx_i.stream_vc][0];
 
         if (head_like) begin
           for (reset_task_idx = 0; reset_task_idx < CNOC_MAX_TASKS;
                reset_task_idx = reset_task_idx + 1) begin
-            accum_q[ctx_i.out_sel][ctx_i.vc_id][reset_task_idx] <= '0;
+            accum_q[ctx_i.stream_port][ctx_i.stream_vc][reset_task_idx] <= '0;
           end
         end
 
@@ -343,7 +343,7 @@ module mfu_alu_matmul #(
         end
 
         if (task_complete) begin
-          accum_q[ctx_i.out_sel][ctx_i.vc_id][task_idx_q] <= task_sum_clamped;
+          accum_q[ctx_i.stream_port][ctx_i.stream_vc][task_idx_q] <= task_sum_clamped;
           result_flit_q <= result_flit_after_task;
           data_sum_q <= '0;
           compute_base_idx_q <= 6'd0;
@@ -353,7 +353,7 @@ module mfu_alu_matmul #(
                 task_weight_base_q + {16'd0, weight_row_size_q};
             task_base_q <=
                 head_like ? '0 :
-                accum_q[ctx_i.out_sel][ctx_i.vc_id][task_idx_next[4:0]];
+                accum_q[ctx_i.stream_port][ctx_i.stream_vc][task_idx_next[4:0]];
           end else begin
             active_q <= 1'b0;
             result_valid_q <= 1'b1;
@@ -364,7 +364,7 @@ module mfu_alu_matmul #(
       if (release_state_i && data_op) begin
         for (reset_task_idx = 0; reset_task_idx < CNOC_MAX_TASKS;
              reset_task_idx = reset_task_idx + 1) begin
-          accum_q[ctx_i.out_sel][ctx_i.vc_id][reset_task_idx] <= '0;
+          accum_q[ctx_i.stream_port][ctx_i.stream_vc][reset_task_idx] <= '0;
         end
       end
     end

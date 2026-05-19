@@ -58,7 +58,7 @@ module mfu_alu_default #(
     if (scalar_b_i == 32'sd0) begin
       sat_tmp = 32'sd0;
     end else begin
-      unique case (scalar_a_i[7:0])
+      case (scalar_a_i[7:0])
         8'h00: exp_tmp = 32'sd16;
         8'h01: exp_tmp = 32'sd17;
         8'h02: exp_tmp = 32'sd18;
@@ -317,7 +317,7 @@ module mfu_alu_default #(
         8'hff: exp_tmp = 32'sd15;
         default: exp_tmp = 32'sd0;
       endcase
-      unique case (scalar_b_i[7:0])
+      case (scalar_b_i[7:0])
         8'h00: recip_tmp = 32'sd0;
         8'h01: recip_tmp = 32'sd127;
         8'h02: recip_tmp = 32'sd127;

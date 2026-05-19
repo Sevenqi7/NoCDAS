@@ -1,6 +1,9 @@
 // Description: Five-by-five combinational crossbar.
 //              Selection values identify the input port driving each output
 //              port.  Typed metadata follows the payload through the same mux.
+//              The current pipelined Router top performs output staging
+//              internally; this module remains as a standalone reference block
+//              for legacy/unit coverage and is not on Router.sv's main path.
 
 module CrossBar #(
     parameter integer FLIT_W = router_ports_pkg::FLIT_W

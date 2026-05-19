@@ -93,6 +93,9 @@ constexpr int META_CNOC_PAIR_MASK_W = 16;
 constexpr int META_ATTENTION_RM_LSB = META_CNOC_PAIR_MASK_LSB;
 constexpr int META_ATTENTION_RS_LSB = META_CNOC_PAIR_MASK_LSB + 8;
 constexpr int META_ATTENTION_STATE_W = 8;
+constexpr int META_COSIM_DATA_Q_LSB = 97;
+constexpr int META_COSIM_FLIT_ID_LSB = 105;
+constexpr int META_COSIM_PACKET_UID_LSB = 121;
 constexpr int META_COSIM_TOKEN_LSB = 153;
 
 static_assert(META_COSIM_TOKEN_LSB + 24 <= RTL_META_BITS,
@@ -170,6 +173,7 @@ public:
 
   void runOneStep();
   void resetCnocState();
+  bool ownsCnocMfu() const;
   unsigned int cnocWeightBytesStored() const;
   unsigned int cnocKvBytesStored() const;
   unsigned int cnocKvTokenCount() const;

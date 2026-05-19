@@ -17,6 +17,8 @@ module cnoc_mfu #(
     input  router_ports_pkg::flit_meta_t raw_meta_i,
     input  router_ports_pkg::route_path_t raw_route_path_i,
     input  logic [VC_ID_W-1:0] raw_vc_id_i,
+    input  logic [2:0] raw_stream_port_i,
+    input  logic [VC_ID_W-1:0] raw_stream_vc_i,
     input  logic [2:0] raw_out_sel_i,
     input  logic raw_valid_i,
 
@@ -68,6 +70,8 @@ module cnoc_mfu #(
   flit_meta_t pkt_meta_q;
   route_path_t pkt_route_path_q;
   logic [VC_ID_W-1:0] pkt_vc_q;
+  logic [2:0] pkt_stream_port_q;
+  logic [VC_ID_W-1:0] pkt_stream_vc_q;
   logic [2:0] pkt_out_sel_q;
 
   // DECODE stage fields from the registered cNoC flit.
@@ -92,7 +96,6 @@ module cnoc_mfu #(
   logic compute_done;
   logic emit_ready;
   logic decoded_is_data_op;
-
   // Type4 distribution path: payload bytes are written into either the weight
   // SRAM bank or the Attention KV bank.
   logic [ALU_DATA_W-1:0] sram_rdata;
@@ -110,7 +113,7 @@ module cnoc_mfu #(
   logic [15:0] type4_kv_max_tokens_raw;
   logic [15:0] type4_kv_max_tokens_safe;
   logic [15:0] type4_kv_sink_limit;
-  logic [31:0] type4_kv_max_tokens_full;
+  logic type4_kv_stride_supported;
   logic [15:0] type4_kv_slot_q;
   logic [15:0] type4_kv_slot_next;
   logic [15:0] type4_kv_slot;
@@ -164,12 +167,22 @@ module cnoc_mfu #(
   always_comb begin : proc_type4_storage
     type4_bank_sel = (decoded_opcode_q == OPCODE_ATTENTION);
     type4_kv_stride = (decoded_k_dim_q == 16'd0) ? 16'd1 : (decoded_k_dim_q << 1);
-    type4_kv_max_tokens_full =
-        (type4_kv_stride == 16'd0) ? 32'd1 : (SRAM_DEPTH / type4_kv_stride);
-    type4_kv_max_tokens_raw =
-        (type4_kv_max_tokens_full == 32'd0) ? 16'd0 :
-        (type4_kv_max_tokens_full > 32'h0000_ffff) ? 16'hffff :
-                                                     type4_kv_max_tokens_full[15:0];
+    type4_kv_stride_supported = 1'b1;
+    case (type4_kv_stride)
+      16'd1:   type4_kv_max_tokens_raw = 16'(SRAM_DEPTH);
+      16'd2:   type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 1);
+      16'd4:   type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 2);
+      16'd8:   type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 3);
+      16'd16:  type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 4);
+      16'd32:  type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 5);
+      16'd64:  type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 6);
+      16'd128: type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 7);
+      16'd256: type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 8);
+      default: begin
+        type4_kv_max_tokens_raw = 16'd1;
+        type4_kv_stride_supported = 1'b0;
+      end
+    endcase
     type4_kv_max_tokens_safe =
         (type4_kv_max_tokens_raw == 16'd0) ? 16'd1 : type4_kv_max_tokens_raw;
     type4_kv_sink_limit =
@@ -251,6 +264,8 @@ module cnoc_mfu #(
     alu_op.is_data_op = decoded_is_data_op;
     alu_op.is_attention = decoded_is_type5_q && (decoded_opcode_q == OPCODE_ATTENTION);
   end
+  assign alu_ctx.stream_port = pkt_stream_port_q;
+  assign alu_ctx.stream_vc = pkt_stream_vc_q;
   assign alu_ctx.vc_id = pkt_vc_q;
   assign alu_ctx.out_sel = pkt_out_sel_q;
   assign alu_ctx.kv_token_count = type4_kv_token_count_q;
@@ -268,6 +283,7 @@ module cnoc_mfu #(
   assign last_type4_store_bank_o = last_type4_store_bank_q;
   assign last_type4_store_addr_o = last_type4_store_addr_q;
   assign last_type4_store_bytes_o = last_type4_store_bytes_q;
+
 `endif
 
   always_ff @(posedge clk) begin : proc_mfu_registers
@@ -278,6 +294,8 @@ module cnoc_mfu #(
       pkt_meta_q <= '0;
       pkt_route_path_q <= '0;
       pkt_vc_q <= '0;
+      pkt_stream_port_q <= ROUTER_PORT_INV;
+      pkt_stream_vc_q <= '0;
       pkt_out_sel_q <= '0;
       decoded_opcode_q <= 5'd0;
       decoded_data_idx_q <= 10'd0;
@@ -311,6 +329,8 @@ module cnoc_mfu #(
         pkt_meta_q <= raw_meta_i;
         pkt_route_path_q <= raw_route_path_i;
         pkt_vc_q <= raw_vc_id_i;
+        pkt_stream_port_q <= raw_stream_port_i;
+        pkt_stream_vc_q <= raw_stream_vc_i;
         pkt_out_sel_q <= raw_out_sel_i;
       end
 
@@ -490,6 +510,11 @@ module cnoc_mfu #(
       // enable must never fire for non-type4 packets.
       if (sram_wr_en && !decoded_is_type4_q) begin
         $error("cnoc_mfu: SRAM write asserted for non-type4 packet");
+      end
+      if (decoded_is_type4_q &&
+          (decoded_opcode_q == OPCODE_ATTENTION) &&
+          !type4_kv_stride_supported) begin
+        $error("cnoc_mfu: unsupported Attention type4 KV stride");
       end
     end
   end

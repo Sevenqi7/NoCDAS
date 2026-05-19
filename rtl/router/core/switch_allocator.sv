@@ -3,6 +3,9 @@
 //              over input ports that request that output.  cNoC MFU traffic is
 //              additionally gated so that at most one MFU-bound flit is
 //              captured in a cycle.
+//              The current pipelined Router top owns switch selection
+//              internally; this module remains as standalone unit-tested
+//              reference coverage.
 
 module switch_allocator #(
     parameter int NUM_PORTS = router_ports_pkg::PORT_NUM,
@@ -65,7 +68,7 @@ module switch_allocator #(
       for (int out_idx = 0; out_idx < NUM_PORTS; out_idx = out_idx + 1) begin
         request_to_output[in_idx][out_idx] =
             rinport_req_i[in_idx] &&
-            (rinport_route_sel_i[in_idx] == out_idx[2:0]);
+            (rinport_route_sel_i[in_idx] == 3'(out_idx));
 
         request_has_vc[in_idx][out_idx] =
             request_to_output[in_idx][out_idx] &&
@@ -106,6 +109,7 @@ module switch_allocator #(
 
     // First choose at most one MFU-bound input globally.  This prevents two
     // switch winners from entering the single MFU in the same cycle.
+`ifdef ENABLE_CNOC_MFU
     if (!mfu_busy_i) begin
       for (int prio_idx = int'(ROUTER_TRAFFIC_COMP);
            prio_idx >= int'(ROUTER_TRAFFIC_REGULAR);
@@ -118,22 +122,27 @@ module switch_allocator #(
 
           if ((mfu_winner == PORT_SEL_INVALID) &&
               mfu_candidate_by_class[prio_idx][candidate_idx]) begin
-            mfu_winner = candidate_idx[2:0];
+            mfu_winner = 3'(candidate_idx);
           end
         end
       end
     end
+`endif
   end
 
   always_comb begin : proc_mfu_allowed
     for (int in_idx = 0; in_idx < NUM_PORTS; in_idx = in_idx + 1) begin
+`ifdef ENABLE_CNOC_MFU
       // MFU-bound flits cannot bypass the MFU.  They may leave the crossbar only
       // when the MFU is free and this input is the single MFU winner.
       if (mfu_rinport_req_i[in_idx]) begin
-        mfu_allowed[in_idx] = !mfu_busy_i && (in_idx[2:0] == mfu_winner);
+        mfu_allowed[in_idx] = !mfu_busy_i && (3'(in_idx) == mfu_winner);
       end else begin
         mfu_allowed[in_idx] = 1'b1;
       end
+`else
+      mfu_allowed[in_idx] = 1'b1;
+`endif
     end
   end
 
@@ -196,7 +205,7 @@ module switch_allocator #(
             if ((routport_winner_o[out_idx] == PORT_SEL_INVALID) &&
                 request_eligible[candidate_idx][out_idx] &&
                 (rinport_traffic_class_i[candidate_idx] == priority_class[out_idx][prio_idx])) begin
-              routport_winner_o[out_idx] = candidate_idx[2:0];
+              routport_winner_o[out_idx] = 3'(candidate_idx);
             end
           end
         end
@@ -220,7 +229,7 @@ module switch_allocator #(
       // A granted output advances its RR pointer to the input after the winner.
       if (routport_winner_o[out_idx] != PORT_SEL_INVALID) begin
         rr_ptr_d[out_idx] =
-            (routport_winner_o[out_idx] == (NUM_PORTS - 1)) ?
+            (routport_winner_o[out_idx] == 3'(NUM_PORTS - 1)) ?
             '0 : (routport_winner_o[out_idx] + 3'd1);
 
         // Serving regular traffic clears the starvation counter for that output.
@@ -243,9 +252,11 @@ module switch_allocator #(
     mfu_rr_ptr_d = mfu_rr_ptr_q;
     // The MFU winner pointer rotates only when a cNoC/MFU flit is selected,
     // preserving the previous fairness behavior across MFU-bound traffic.
+`ifdef ENABLE_CNOC_MFU
     if (mfu_winner != PORT_SEL_INVALID) begin
-      mfu_rr_ptr_d = (mfu_winner == (NUM_PORTS - 1)) ? '0 : (mfu_winner + 3'd1);
+      mfu_rr_ptr_d = (mfu_winner == 3'(NUM_PORTS - 1)) ? '0 : (mfu_winner + 3'd1);
     end
+`endif
   end
 
   always_ff @(posedge clk_i) begin : proc_registers
@@ -253,7 +264,7 @@ module switch_allocator #(
     // not always favor input 0 on every output after reset.
     if (reset_i) begin
       for (int out_idx = 0; out_idx < NUM_PORTS; out_idx = out_idx + 1) begin
-        rr_ptr_q[out_idx] <= out_idx[2:0];
+        rr_ptr_q[out_idx] <= 3'(out_idx);
         regular_starve_cnt_q[out_idx] <= 8'd0;
       end
       mfu_rr_ptr_q <= '0;
@@ -277,7 +288,7 @@ module switch_allocator #(
         // flit into more than one output.
         grant_count = 0;
         for (int out_idx = 0; out_idx < NUM_PORTS; out_idx = out_idx + 1) begin
-          if (routport_winner_o[out_idx] == in_idx[2:0]) begin
+          if (routport_winner_o[out_idx] == 3'(in_idx)) begin
             grant_count++;
           end
         end

@@ -9,6 +9,7 @@ module mfu_alu_geglu #(
     input  logic start_i,
     input  logic [FLIT_W-1:0] flit_i,
     input  router_ports_pkg::flit_meta_t meta_i,
+    input  router_ports_pkg::mfu_alu_ctx_t ctx_i,
     input  logic signed [31:0] scalar_a_i,
     input  logic signed [31:0] scalar_b_i,
     output logic busy_o,
@@ -24,6 +25,7 @@ module mfu_alu_geglu #(
 `endif
 
   integer lane_idx;
+  integer task_idx;
   logic signed [31:0] lhs_q;
   logic signed [31:0] rhs_q;
   logic signed [31:0] nonlinear_tmp;
@@ -38,6 +40,12 @@ module mfu_alu_geglu #(
   logic [4:0] data_lane;
   logic [5:0] payload_len;
   logic [5:0] effective_payload_len;
+  logic [5:0] task_count_limited;
+  logic [CNOC_TASK_ID_W-1:0] task_id_current;
+  logic [16:0] required_flit_offset;
+  logic [16:0] flit_start_idx;
+  logic [16:0] flit_end_idx;
+  logic [5:0] local_lane;
   logic [15:0] pair_update_mask;
   logic [FLIT_W-1:0] result_flit;
   flit_meta_t result_meta;
@@ -45,12 +53,35 @@ module mfu_alu_geglu #(
 
   assign data_lane = meta_i.data_offset[4:0];
   assign payload_len = meta_i.payload_len;
-  assign pair_update_mask = meta_i.header_reserved;
+  assign task_count_limited =
+      (ctx_i.task_count > 6'(CNOC_MAX_TASKS)) ? 6'(CNOC_MAX_TASKS) : ctx_i.task_count;
   assign effective_payload_len =
       (payload_len == 6'd0) ? 6'd1 :
       (payload_len > 6'd32) ? 6'd32 :
                               payload_len;
   assign busy_o = 1'b0;
+
+  always_comb begin : proc_pair_update_mask
+    pair_update_mask = '0;
+    task_id_current = '0;
+    required_flit_offset = '0;
+    flit_start_idx = {7'd0, meta_i.data_offset};
+    flit_end_idx = {7'd0, meta_i.data_offset} + {11'd0, effective_payload_len};
+    local_lane = 6'd0;
+
+    for (task_idx = 0; task_idx < CNOC_MAX_TASKS; task_idx = task_idx + 1) begin
+      if (6'(task_idx) < task_count_limited) begin
+        task_id_current = ctx_i.task_ids_flat[task_idx * CNOC_TASK_ID_W +: CNOC_TASK_ID_W];
+        required_flit_offset = {1'b0, task_id_current} << 1;
+        local_lane = required_flit_offset[5:0] - meta_i.data_offset[5:0];
+        if ((required_flit_offset >= flit_start_idx) &&
+            ((required_flit_offset + 17'd1) < flit_end_idx) &&
+            ((local_lane + 6'd1) < 6'd32)) begin
+          pair_update_mask[local_lane[4:1]] = 1'b1;
+        end
+      end
+    end
+  end
 
   always_comb begin : proc_geglu_result
     flit_tmp = flit_i;
@@ -74,7 +105,7 @@ module mfu_alu_geglu #(
 `ifdef NONLINEAR_IMPL_DPI
         nonlinear_tmp = dpi_geglu(lhs_q, rhs_q);
 `else
-        unique case (lhs_q[7:0])
+        case (lhs_q[7:0])
           8'h00: nonlinear_lut_q4 = 32'sd0;
           8'h01: nonlinear_lut_q4 = 32'sd1;
           8'h02: nonlinear_lut_q4 = 32'sd1;

@@ -2,8 +2,8 @@ rtl/router/core/router_ports_pkg.sv
 rtl/router/core/Buffer.sv
 rtl/router/core/CrossBar.sv
 rtl/router/core/cnoc_decode.sv
-rtl/router/core/mfu_ctrl_fsm.v
-rtl/router/core/mfu_sram.v
+rtl/router/core/mfu_ctrl_fsm.sv
+rtl/router/core/mfu_sram.sv
 rtl/router/core/mfu_sram_if.sv
 rtl/router/core/mfu_writeback.sv
 rtl/router/alu/mfu_alu_matmul.sv
@@ -21,5 +21,4 @@ rtl/router/core/input_unit.sv
 rtl/router/core/vc_allocator.sv
 rtl/router/core/switch_allocator.sv
 rtl/router/core/router_output_stage.sv
-rtl/router/core/router_matmul_debug.sv
 rtl/router/core/Router.sv

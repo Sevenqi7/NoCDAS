@@ -256,24 +256,48 @@ public:
     resetModel();
   }
 
+  bool ownsCnocMfu() const {
+#if ENABLE_CNOC_MFU
+    return true;
+#else
+    return false;
+#endif
+  }
+
   // Required: MACnet phase gating reads RTL-owned weight storage progress.
   unsigned int cnocWeightBytesStored() const {
+#if ENABLE_CNOC_MFU
     return static_cast<unsigned int>(model_.cnoc_weight_bytes_stored);
+#else
+    return 0u;
+#endif
   }
 
   // Required: MACnet phase gating reads RTL-owned KV storage progress.
   unsigned int cnocKvBytesStored() const {
+#if ENABLE_CNOC_MFU
     return static_cast<unsigned int>(model_.cnoc_kv_bytes_stored);
+#else
+    return 0u;
+#endif
   }
 
   // Required: MACnet phase gating reads RTL-owned KV token progress.
   unsigned int cnocKvTokenCount() const {
+#if ENABLE_CNOC_MFU
     return static_cast<unsigned int>(model_.cnoc_kv_token_count);
+#else
+    return 0u;
+#endif
   }
 
   // Required: MACnet phase gating observes type4 store events.
   bool cnocLastType4StoreValid() const {
+#if ENABLE_CNOC_MFU
     return model_.cnoc_last_type4_store_valid != 0;
+#else
+    return false;
+#endif
   }
 
 private:
@@ -293,6 +317,7 @@ private:
 
   // Required: converts NoCDAS assigned tasks and weight row size into RTL config inputs.
   void driveCnocTaskConfig() {
+#if ENABLE_CNOC_MFU
     const int task_count =
         std::min(static_cast<int>(owner_->assigned_tasks.size()), RTL_CNOC_MAX_TASKS);
     model_.cnoc_task_count = static_cast<unsigned char>(task_count);
@@ -305,6 +330,7 @@ private:
       setField(packed_task_ids, slot * RTL_CNOC_TASK_ID_BITS, RTL_CNOC_TASK_ID_BITS, task_id);
     }
     writeWideWord(model_.cnoc_task_ids_flat, packed_task_ids);
+#endif
   }
 
   // Required: reset sequence must put the Verilated router in a reproducible idle state.
@@ -549,7 +575,11 @@ private:
     }
 
     TokenRecord rec = it->second;
+#if ENABLE_CNOC_MFU
     mirrorRtlCnocPayload(rec.flit, meta, payload);
+#else
+    applyCppCnocSideEffects(rec.flit, rtl_out_port);
+#endif
     const int cpp_out_port = RTL_TO_CPP_PORT[rtl_out_port];
     if (getBit(route_path, ROUTE_PATH_VALID_BIT) && rec.flit != nullptr) {
       const uint32_t route_len = getField(route_path, ROUTE_PATH_LEN_LSB, ROUTE_PATH_LEN_W);
@@ -563,6 +593,33 @@ private:
         rec.src_cpp_port,
         rec.src_vc});
     token_to_flit_.erase(it);
+  }
+
+  void applyCppCnocSideEffects(Flit* flit, int rtl_out_port) {
+    if (flit == nullptr || flit->packet == nullptr) {
+      return;
+    }
+
+    const int msg_type = flit->packet->message.type;
+    const int cpp_out_port = RTL_TO_CPP_PORT[rtl_out_port];
+    if (msg_type == CNOC_TYPE_DIST) {
+      const int this_router = owner_->id[0] * X_NUM + owner_->id[1];
+      bool is_target = false;
+      for (int router_id : flit->packet->message.routing_path) {
+        if (router_id == this_router) {
+          is_target = true;
+        }
+      }
+      if (flit->packet->destination[0] == owner_->id[0] &&
+          flit->packet->destination[1] == owner_->id[1]) {
+        is_target = true;
+      }
+      if (is_target) {
+        owner_->processDistributionPacket(flit);
+      }
+    } else if (msg_type == CNOC_TYPE_COMP) {
+      owner_->computeInTransit(flit, cpp_out_port);
+    }
   }
 
   // Moves a pending output flit into the next hop if the target C++ RInPort state allows it.
@@ -923,6 +980,14 @@ private:
              META_CNOC_PAIR_MASK_LSB,
              META_CNOC_PAIR_MASK_W,
              cnoc_reserved);
+    setField(meta,
+             META_COSIM_FLIT_ID_LSB,
+             16,
+             static_cast<uint32_t>(std::clamp(flit->id, 0, 0xffff)));
+    setField(meta,
+             META_COSIM_PACKET_UID_LSB,
+             32,
+             static_cast<uint32_t>(std::max(flit->packet->message.signal_id, 0)));
 
     if (head_like &&
         (flit->packet->message.type == CNOC_TYPE_DIST ||
@@ -963,6 +1028,10 @@ void VerilatedRouter::resetCnocState() {
 
 unsigned int VerilatedRouter::cnocWeightBytesStored() const {
   return impl_->cnocWeightBytesStored();
+}
+
+bool VerilatedRouter::ownsCnocMfu() const {
+  return impl_->ownsCnocMfu();
 }
 
 unsigned int VerilatedRouter::cnocKvBytesStored() const {

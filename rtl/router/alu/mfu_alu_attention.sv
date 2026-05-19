@@ -94,7 +94,7 @@ module mfu_alu_attention #(
   logic [15:0] k_dim_safe;
   logic [15:0] k_dim_clamped;
   logic [15:0] token_stride;
-  logic [31:0] max_tokens_full;
+  logic token_stride_supported;
   logic [15:0] max_tokens_clamped;
   logic [15:0] active_tokens;
   logic [5:0] task_count_limited;
@@ -164,7 +164,7 @@ module mfu_alu_attention #(
   assign is_attention_op = op_i.is_attention;
   assign head_like = flit_is_head_like(pkt_meta_i.flit_kind);
   assign tail_like = flit_is_tail_like(pkt_meta_i.flit_kind);
-  assign context_ready = query_valid_q[ctx_i.out_sel][ctx_i.vc_id] || head_like;
+  assign context_ready = query_valid_q[ctx_i.stream_port][ctx_i.stream_vc] || head_like;
   assign effective_payload_len =
       (pkt_meta_i.payload_len == 6'd0) ? 6'd0 :
       (pkt_meta_i.payload_len > 6'd32) ? 6'd32 :
@@ -173,10 +173,6 @@ module mfu_alu_attention #(
   assign k_dim_clamped =
       (k_dim_safe > MAX_K_DIM[15:0]) ? MAX_K_DIM[15:0] : k_dim_safe;
   assign token_stride = k_dim_clamped << 1;
-  assign max_tokens_full =
-      (token_stride == 16'd0) ? 32'd1 : (SRAM_DEPTH_U32 / {16'd0, token_stride});
-  assign max_tokens_clamped =
-      (max_tokens_full > 32'h0000_ffff) ? 16'hffff : max_tokens_full[15:0];
   assign active_tokens =
       (ctx_i.kv_token_count < max_tokens_clamped) ? ctx_i.kv_token_count :
                                                     max_tokens_clamped;
@@ -210,6 +206,27 @@ module mfu_alu_attention #(
       token_base_addr_full + {16'd0, k_dim_q} + {16'd0, task_id_next};
   assign next_token_read_addr_full =
       ({16'd0, token_idx_q} + 32'd1) * {16'd0, token_stride_q};
+
+  always_comb begin : proc_token_capacity
+    token_stride_supported = 1'b1;
+    case (token_stride)
+      16'd2:   max_tokens_clamped = 16'(SRAM_DEPTH >> 1);
+      16'd4:   max_tokens_clamped = 16'(SRAM_DEPTH >> 2);
+      16'd8:   max_tokens_clamped = 16'(SRAM_DEPTH >> 3);
+      16'd16:  max_tokens_clamped = 16'(SRAM_DEPTH >> 4);
+      16'd32:  max_tokens_clamped = 16'(SRAM_DEPTH >> 5);
+      16'd64:  max_tokens_clamped = 16'(SRAM_DEPTH >> 6);
+      16'd128: max_tokens_clamped = 16'(SRAM_DEPTH >> 7);
+      16'd256: max_tokens_clamped = 16'(SRAM_DEPTH >> 8);
+      default: begin
+        max_tokens_clamped = 16'd1;
+        token_stride_supported = 1'b0;
+      end
+    endcase
+    if (max_tokens_clamped == 16'd0) begin
+      max_tokens_clamped = 16'd1;
+    end
+  end
 
   always_comb begin : proc_data_request
     data_req_valid = 1'b0;
@@ -265,8 +282,8 @@ module mfu_alu_attention #(
       score_query_idx = score_dim_idx[K_DIM_IDX_W-1:0];
       if (score_dim_idx < k_dim_q) begin
         query_q4 =
-            {{24{query_q[ctx_q.out_sel][ctx_q.vc_id][score_query_idx][7]}},
-             query_q[ctx_q.out_sel][ctx_q.vc_id][score_query_idx]};
+            {{24{query_q[ctx_q.stream_port][ctx_q.stream_vc][score_query_idx][7]}},
+             query_q[ctx_q.stream_port][ctx_q.stream_vc][score_query_idx]};
         key_q4 =
             {{24{k_data_q[score_lane_idx * 8 + 7]}},
              k_data_q[score_lane_idx * 8 +: 8]};
@@ -313,7 +330,7 @@ module mfu_alu_attention #(
 `ifdef NONLINEAR_IMPL_DPI
     update_dpi_tmp = dpi_exp(update_exp_input);
 `else
-    unique case (update_exp_idx)
+    case (update_exp_idx)
       8'h00: update_dpi_tmp = 32'sd16;
       8'h01: update_dpi_tmp = 32'sd17;
       8'h02: update_dpi_tmp = 32'sd18;
@@ -586,7 +603,7 @@ module mfu_alu_attention #(
 `ifdef NONLINEAR_IMPL_DPI
     update_dpi_tmp = dpi_exp(update_exp_input);
 `else
-    unique case (update_exp_idx)
+    case (update_exp_idx)
       8'h00: update_dpi_tmp = 32'sd16;
       8'h01: update_dpi_tmp = 32'sd17;
       8'h02: update_dpi_tmp = 32'sd18;
@@ -988,10 +1005,10 @@ module mfu_alu_attention #(
         end
 
         if (head_like) begin
-          query_valid_q[ctx_i.out_sel][ctx_i.vc_id] <= 1'b1;
+          query_valid_q[ctx_i.stream_port][ctx_i.stream_vc] <= 1'b1;
           for (query_lane_idx = 0; query_lane_idx < MAX_K_DIM;
                query_lane_idx = query_lane_idx + 1) begin
-            query_q[ctx_i.out_sel][ctx_i.vc_id][query_lane_idx] <= 8'd0;
+            query_q[ctx_i.stream_port][ctx_i.stream_vc][query_lane_idx] <= 8'd0;
           end
         end
 
@@ -1000,7 +1017,8 @@ module mfu_alu_attention #(
           if ((query_lane_idx < effective_payload_len) &&
               ((pkt_meta_i.data_offset + query_lane_idx) < pkt_meta_i.psum_offset) &&
               ((pkt_meta_i.data_offset + query_lane_idx) < k_dim_clamped)) begin
-            query_q[ctx_i.out_sel][ctx_i.vc_id][pkt_meta_i.data_offset + query_lane_idx] <=
+            query_q[ctx_i.stream_port][ctx_i.stream_vc]
+                   [pkt_meta_i.data_offset + query_lane_idx] <=
                 pkt_flit_i[query_lane_idx * 8 +: 8];
           end
         end
@@ -1076,7 +1094,7 @@ module mfu_alu_attention #(
       end
 
       if (release_state_i && is_attention_op && tail_like) begin
-        query_valid_q[ctx_i.out_sel][ctx_i.vc_id] <= 1'b0;
+        query_valid_q[ctx_i.stream_port][ctx_i.stream_vc] <= 1'b0;
         result_flit_q <= pkt_flit_i;
         result_meta_q <= pkt_meta_i;
       end
@@ -1087,13 +1105,17 @@ module mfu_alu_attention #(
   always_ff @(posedge clk_i) begin : proc_attention_assertions
     if (!reset_i) begin
       if (fetch_en_i && is_attention_op && !head_like &&
-          !query_valid_q[ctx_i.out_sel][ctx_i.vc_id]) begin
+          !query_valid_q[ctx_i.stream_port][ctx_i.stream_vc]) begin
         $error("mfu_alu_attention: body/tail Attention flit arrived without head state");
       end
 
       if (release_state_i && is_attention_op && tail_like &&
-          !query_valid_q[ctx_i.out_sel][ctx_i.vc_id]) begin
+          !query_valid_q[ctx_i.stream_port][ctx_i.stream_vc]) begin
         $error("mfu_alu_attention: release observed without a valid query stream");
+      end
+
+      if (fetch_en_i && is_attention_op && !token_stride_supported) begin
+        $error("mfu_alu_attention: unsupported Attention token stride");
       end
     end
   end

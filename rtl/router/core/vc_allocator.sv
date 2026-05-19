@@ -2,6 +2,9 @@
 //              Head flits allocate an idle downstream VC in the same virtual
 //              network.  Body/tail flits reuse the recorded allocation until
 //              the tail releases the mapping.
+//              The current pipelined Router top owns commit-driven VC
+//              allocation internally; this module remains as standalone
+//              unit-tested reference coverage.
 
 module vc_allocator #(
     parameter int NUM_PORTS = router_ports_pkg::PORT_NUM,
@@ -72,19 +75,25 @@ module vc_allocator #(
   // masks, selected VC calculation, and state updates.
   always_comb begin : proc_vnet_decode
     for (int in_idx = 0; in_idx < NUM_PORTS; in_idx = in_idx + 1) begin
-      preferred_vnet[in_idx] = VNET_URS[1:0];
+      preferred_vnet[in_idx] = 2'(VNET_URS);
 
+`ifdef ENABLE_CNOC_MFU
       // cNoC distribution/compute traffic always uses the LCS VC pool.  This
       // preserves the NoCDAS split between regular traffic and high-priority
       // cNoC traffic even when the incoming header vnet field is stale.
       if (rinport_is_lcs[in_idx]) begin
-        preferred_vnet[in_idx] = VNET_LCS[1:0];
+        preferred_vnet[in_idx] = 2'(VNET_LCS);
 
       // Regular traffic keeps the vnet selected by the packet header when it is
       // within the implemented vnet range.
       end else if (rinport_meta_i[in_idx].vnet < VN_NUM_LOCAL) begin
         preferred_vnet[in_idx] = rinport_meta_i[in_idx].vnet[1:0];
       end
+`else
+      if (rinport_meta_i[in_idx].vnet < VN_NUM_LOCAL) begin
+        preferred_vnet[in_idx] = rinport_meta_i[in_idx].vnet[1:0];
+      end
+`endif
     end
   end
 
@@ -138,7 +147,7 @@ module vc_allocator #(
         // Fallback to the lowest set bit if the vnet pointer is malformed.
         for (int vc_idx = VC_NUM - 1; vc_idx >= 0; vc_idx = vc_idx - 1) begin
           if (head_alloc_mask[in_idx][out_idx][vc_idx]) begin
-            selected_dst_vc[in_idx][out_idx] = vc_idx[VC_ID_W-1:0];
+            selected_dst_vc[in_idx][out_idx] = VC_ID_W'(vc_idx);
           end
         end
 
@@ -166,7 +175,7 @@ module vc_allocator #(
             if (!found_vc &&
                 (candidate_vc < VC_NUM) &&
                 head_alloc_mask[in_idx][out_idx][candidate_vc]) begin
-              selected_dst_vc[in_idx][out_idx] = candidate_vc[VC_ID_W-1:0];
+              selected_dst_vc[in_idx][out_idx] = VC_ID_W'(candidate_vc);
               found_vc = 1'b1;
             end
           end
@@ -193,7 +202,7 @@ module vc_allocator #(
           // Body/tail flits must reuse the downstream VC allocated by their head,
           // and they may proceed only when that VC has credit this cycle.
           end else if (alloc_valid_q[in_idx][src_vc] &&
-                       (alloc_out_port_q[in_idx][src_vc] == out_idx[2:0])) begin
+                       (alloc_out_port_q[in_idx][src_vc] == 3'(out_idx))) begin
             transfer_ready[in_idx][out_idx] =
                 routport_flow_i[out_idx].downstream_vc_credit_mask[
                     alloc_dst_vc_q[in_idx][src_vc]
@@ -286,7 +295,7 @@ module vc_allocator #(
             winner_vnet_base = winner_vnet_idx * VC_PER_VNET;
             winner_vnet_last = winner_vnet_base + VC_PER_VNET - 1;
             if (int'(winner_dst_vc) >= winner_vnet_last) begin
-              vc_rr_ptr_d[out_idx][winner_vnet_idx] = winner_vnet_base[VC_ID_W-1:0];
+              vc_rr_ptr_d[out_idx][winner_vnet_idx] = VC_ID_W'(winner_vnet_base);
             end else begin
               vc_rr_ptr_d[out_idx][winner_vnet_idx] =
                   winner_dst_vc + {{(VC_ID_W-1){1'b0}}, 1'b1};
@@ -294,7 +303,7 @@ module vc_allocator #(
 
             if (!winner_tail_like) begin
               alloc_valid_d[winner_in_port][winner_src_vc] = 1'b1;
-              alloc_out_port_d[winner_in_port][winner_src_vc] = out_idx[2:0];
+              alloc_out_port_d[winner_in_port][winner_src_vc] = 3'(out_idx);
               alloc_dst_vc_d[winner_in_port][winner_src_vc] = winner_dst_vc;
             end
           end
@@ -368,7 +377,7 @@ module vc_allocator #(
           // allocation created by the head and must not allocate a fresh VC.
           if (!rinport_head_like[dbg_in_port] &&
               (!alloc_valid_q[dbg_in_port][dbg_src_vc] ||
-               (alloc_out_port_q[dbg_in_port][dbg_src_vc] != out_idx[2:0]))) begin
+               (alloc_out_port_q[dbg_in_port][dbg_src_vc] != 3'(out_idx)))) begin
             $error("vc_allocator: body/tail transfer without matching head allocation");
           end
         end

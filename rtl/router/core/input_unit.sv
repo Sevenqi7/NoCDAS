@@ -31,6 +31,8 @@ module input_unit #(
   flit_meta_t vc_meta [0:VC_NUM-1];
   logic [2:0] vc_empty_slots [0:VC_NUM-1];
   route_path_t route_path_q [0:VC_NUM-1];
+  logic [VC_NUM-1:0] inflight_q;
+  logic [VC_NUM-1:0] inflight_d;
   logic [VC_NUM-1:0] pop_vec;
   logic [VC_NUM-1:0] push_vec;
   logic [VC_NUM-1:0] push_ack;
@@ -39,7 +41,8 @@ module input_unit #(
   logic [VC_ID_W-1:0] rr_ptr_q;
   logic [VC_ID_W-1:0] selected_vc_d;
   logic selected_valid_d;
-  logic pop_fire_d;
+  logic issue_accept_fire;
+  logic commit_fire;
   logic flit_valid;
   logic [FLIT_W-1:0] issue_flit;
   flit_meta_t issue_meta;
@@ -69,9 +72,9 @@ module input_unit #(
   int issue_route_seq_base;
   int rr_ptr_int;
 
-  integer search_idx;
-  integer vc_idx;
-  integer route_vc_idx;
+  int unsigned search_idx;
+  int unsigned vc_idx;
+  int unsigned route_vc_idx;
 
 
   genvar vc_gen_idx;
@@ -94,7 +97,7 @@ module input_unit #(
     end
   endgenerate
 
-  integer sel_iter;
+  int unsigned sel_iter;
 
   // Select one non-empty VC in round-robin order starting from the last granted VC.
   always_comb begin
@@ -109,9 +112,11 @@ module input_unit #(
         search_idx = search_idx - VC_NUM;
       // Buffer empty_slots < depth means there is at least one flit buffered.
       // Keep the first non-empty VC found from the current RR pointer.
-      if (!selected_valid_d && vc_empty_slots[search_idx] < 3'd4) begin
+      if (!selected_valid_d &&
+          (vc_empty_slots[search_idx] < 3'd4) &&
+          !inflight_q[search_idx]) begin
         selected_valid_d = 1'b1;
-        selected_vc_d = search_idx[VC_ID_W-1:0];
+        selected_vc_d = VC_ID_W'(search_idx);
       end
     end
   end
@@ -120,27 +125,30 @@ module input_unit #(
     if (reset) begin
       selected_vc_q <= '0;
       rr_ptr_q <= '0;
+      inflight_q <= '0;
       for (route_vc_idx = 0; route_vc_idx < VC_NUM; route_vc_idx = route_vc_idx + 1) begin
         route_path_q[route_vc_idx] <= '0;
       end
     end else begin
+      inflight_q <= inflight_d;
+
       if (selected_valid_d)
         selected_vc_q <= selected_vc_d;
 
-      // A granted pop consumes the selected flit, so the next arbitration starts
-      // from the following VC.
-      if (pop_fire_d)
+      // A committed pop consumes the flit, so the next arbitration starts from
+      // the following VC.
+      if (commit_fire)
         rr_ptr_q <= (selected_vc_q == VC_LAST) ? '0 : (selected_vc_q + {{(VC_ID_W-1){1'b0}}, 1'b1});
-      // Even when a flit is merely presented but not granted, advance the scan to
-      // avoid parking the input scheduler on one blocked VC forever.
-      else if (issue_valid)
+      // Once a flit enters the router pipeline, advance the scan so this input
+      // can expose another non-inflight VC while the first flit waits downstream.
+      else if (issue_accept_fire)
         rr_ptr_q <= (selected_vc_q == VC_LAST) ? '0 : (selected_vc_q + {{(VC_ID_W-1){1'b0}}, 1'b1});
 
       // Source-route context is associated with the VC that accepted the head flit.
       // The route path will be stored in the per-VC registers until the tail flit pops and clears it.
-      if (pop_fire_d) begin
-        if (issue_tail_like) begin
-          route_path_q[selected_vc_q] <= '0;
+      if (commit_fire) begin
+        if (rinport_ctrl_i.commit_tail_like) begin
+          route_path_q[rinport_ctrl_i.commit_vc] <= '0;
         end
       end
 
@@ -154,21 +162,22 @@ module input_unit #(
 
 
   always_comb begin : proc_issue_semantics
-    // Type4 distribution and type5 compute may require MFU capture.  The Router
-    // top level decides whether this specific router should process type4.  For
-    // type5, source-route process masks already tell this input VC whether the
-    // current hop should enter the MFU.
+    // Type4/type5 only have MFU semantics when ENABLE_CNOC_MFU is compiled in.
     issue_is_type4 = (issue_meta.msg_type == ROUTER_MSG_DIST);
     issue_is_type5 = (issue_meta.msg_type == ROUTER_MSG_COMP);
     issue_head_like = flit_is_head_like(issue_meta.flit_kind);
     issue_tail_like = flit_is_tail_like(issue_meta.flit_kind);
     input_head_like = flit_is_head_like(rinport_data_i.meta.flit_kind);
 
-    unique case (issue_meta.msg_type)
+`ifdef ENABLE_CNOC_MFU
+    case (issue_meta.msg_type)
       ROUTER_MSG_COMP: issue_msg_traffic_class = ROUTER_TRAFFIC_COMP;
       ROUTER_MSG_DIST: issue_msg_traffic_class = ROUTER_TRAFFIC_DIST;
       default:         issue_msg_traffic_class = ROUTER_TRAFFIC_REGULAR;
     endcase
+`else
+    issue_msg_traffic_class = ROUTER_TRAFFIC_REGULAR;
+`endif
 
     // Prefer the explicit header traffic class when it is in range.  Fallback
     // to message type so a corrupted header cannot create an undefined class.
@@ -178,11 +187,18 @@ module input_unit #(
       issue_traffic_class = issue_msg_traffic_class;
     end
 
+`ifdef ENABLE_CNOC_MFU
     issue_may_need_mfu = (issue_is_type5 && issue_meta.process) || issue_is_type4;
+`else
+    issue_may_need_mfu = 1'b0;
+`endif
   end
 
   assign flit_valid = issue_meta.valid;
-  assign issue_has_flit = !reset && flit_valid && (issue_empty_slots < 3'd4);
+  assign issue_has_flit = !reset &&
+                           flit_valid &&
+                           (issue_empty_slots < 3'd4) &&
+                           !inflight_q[selected_vc_q];
 
 
   // Issue selected VC's flit and meta to route computation and switch allocation.
@@ -215,21 +231,33 @@ module input_unit #(
     // level performs VC allocation, switch arbitration, and MFU gating.
     issue_meta.route_valid = issue_route_valid;
     issue_meta.route_ptr = issue_route_ptr;
+`ifdef ENABLE_CNOC_MFU
     if (issue_meta.msg_type == ROUTER_MSG_COMP) begin
       issue_meta.process = issue_route_process_mask_bit;
     end
+`endif
 
-    // Wait allocator's grant before popping the VC buffer.
     issue_valid = 1'b0;
-    pop_fire_d = 1'b0;
+    issue_accept_fire = 1'b0;
+    commit_fire = rinport_ctrl_i.commit_valid;
     if (issue_has_flit) begin
       issue_valid = 1'b1;
-      pop_fire_d = rinport_ctrl_i.vc_grant;
+      issue_accept_fire = rinport_ctrl_i.issue_accept;
     end
 
     pop_vec = '0;
-    if (pop_fire_d)
-      pop_vec[selected_vc_q] = 1'b1;
+    if (commit_fire)
+      pop_vec[rinport_ctrl_i.commit_vc] = 1'b1;
+  end
+
+  always_comb begin : proc_inflight_next
+    inflight_d = inflight_q;
+    if (commit_fire) begin
+      inflight_d[rinport_ctrl_i.commit_vc] = 1'b0;
+    end
+    if (issue_accept_fire) begin
+      inflight_d[selected_vc_q] = 1'b1;
+    end
   end
 
 
@@ -271,8 +299,7 @@ module input_unit #(
   assign rinport_issue_o.valid = issue_valid;
   assign rinport_issue_o.route_sel = issue_route_sel;
   // This issue bundle is consumed only by Router's route/VC/switch datapath.
-  // FIFO pop remains controlled internally by pop_fire_d; exporting it would
-  // create a grant -> issue -> allocator false combinational loop.
+  // FIFO pop remains controlled internally by the commit sideband.
   assign rinport_issue_o.pop_fire = 1'b0;
   assign rinport_issue_o.sel_vc = issue_sel_vc;
   assign rinport_raw_meta_o = issue_meta;
@@ -286,11 +313,12 @@ module input_unit #(
 `ifndef SYNTHESIS
   always_ff @(posedge clk) begin
     if (!reset) begin
-      // A switch grant is allowed to remove data only when the selected VC is
-      // actually presenting a valid flit.  This catches flit-drop bugs where
-      // arbitration and FIFO state drift apart.
-      if (pop_fire_d && !issue_has_flit) begin
-        $error("input_unit: attempted to pop an empty/invalid selected VC");
+      if (commit_fire && !inflight_q[rinport_ctrl_i.commit_vc]) begin
+        $error("input_unit: attempted to commit a VC without an inflight flit");
+      end
+
+      if (issue_accept_fire && !issue_has_flit) begin
+        $error("input_unit: accepted an empty/invalid selected VC into pipeline");
       end
 
       // The environment may only inject into a physically implemented VC.  The

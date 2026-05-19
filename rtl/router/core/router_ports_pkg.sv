@@ -134,6 +134,8 @@ package router_ports_pkg;
   } mfu_alu_op_t;
 
   typedef struct packed {
+    logic [2:0] stream_port;
+    logic [VC_ID_W-1:0] stream_vc;
     logic [VC_ID_W-1:0] vc_id;
     logic [2:0] out_sel;
     logic [15:0] kv_token_count;
@@ -220,7 +222,10 @@ package router_ports_pkg;
 
   // Router ingress control sideband consumed by rinport(input_unit).
   typedef struct packed {
-    logic                     vc_grant;
+    logic                     issue_accept;
+    logic                     commit_valid;
+    logic [VC_ID_W-1:0]       commit_vc;
+    logic                     commit_tail_like;
     logic [2:0]               x_cur;
     logic [2:0]               y_cur;
     logic [2:0]               in_channel;

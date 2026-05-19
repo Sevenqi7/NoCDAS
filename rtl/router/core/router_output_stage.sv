@@ -2,6 +2,9 @@
 //              Converts crossbar-selected outputs into raw cNoC/MFU candidates,
 //              advances source-route pointers, suppresses MFU-captured flits,
 //              and reinserts MFU writeback results.
+//              The current pipelined Router top owns output commit internally;
+//              this module remains a standalone legacy/reference block rather
+//              than Router.sv's active output stage.
 
 module router_output_stage #(
     parameter int NUM_PORTS = router_ports_pkg::PORT_NUM,
