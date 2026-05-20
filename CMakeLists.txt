@@ -9,7 +9,11 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(CNOC_QUANT_GOLDEN "Enable compile-time INT8 cNoC quantized golden trace mode" OFF)
-option(RTL_DEBUG_MATMUL "Enable guarded RTL MatMul/Linear debug displays in the Verilated router" OFF)
+option(ENABLE_CNOC_MFU "Enable RTL cNoC/MFU side pipeline in the Verilated router" OFF)
+
+if(CNOC_QUANT_GOLDEN)
+    set(ENABLE_CNOC_MFU ON CACHE BOOL "Enable RTL cNoC/MFU side pipeline in the Verilated router" FORCE)
+endif()
 
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 set(RTL_ROUTER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/rtl/router")
@@ -34,8 +38,8 @@ if(VERILATOR_ROOT AND EXISTS "${VERILATOR_ROOT}/include/verilated.cpp")
     set(VERILATED_ROUTER_RUNTIME_LIB "${VERILATED_ROUTER_DIR}/libverilated.a")
     set(VERILATED_ROUTER_ALL_LIB "${VERILATED_ROUTER_DIR}/VNoCRouter__ALL.a")
     set(VERILATED_ROUTER_DEFINES "-DROUTER_ENABLE_COSIM" "-DNONLINEAR_IMPL_DPI")
-    if(RTL_DEBUG_MATMUL)
-        list(APPEND VERILATED_ROUTER_DEFINES "-DRTL_DEBUG_MATMUL")
+    if(ENABLE_CNOC_MFU)
+        list(APPEND VERILATED_ROUTER_DEFINES "-DENABLE_CNOC_MFU")
     endif()
 
     file(STRINGS "${RTL_ROUTER_FILELIST}" RTL_ROUTER_FILELIST_ENTRIES)
@@ -89,6 +93,10 @@ target_include_directories(NoCDASim PRIVATE src src/NoC src/input)
 
 if(CNOC_QUANT_GOLDEN)
     target_compile_definitions(NoCDASim PRIVATE CNOC_QUANT_GOLDEN=1)
+endif()
+
+if(ENABLE_CNOC_MFU)
+    target_compile_definitions(NoCDASim PRIVATE ENABLE_CNOC_MFU=1)
 endif()
 
 if(VERILATOR_ROOT AND EXISTS "${VERILATOR_ROOT}/include")

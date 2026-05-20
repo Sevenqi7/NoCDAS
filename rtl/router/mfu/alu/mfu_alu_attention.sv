@@ -32,7 +32,11 @@ module mfu_alu_attention #(
     output logic busy_o,
     output logic result_valid_o,
     output logic [FLIT_W-1:0] result_flit_o,
-    output router_ports_pkg::flit_meta_t result_meta_o
+    output router_ports_pkg::flit_meta_t result_meta_o,
+    output logic mul_req_o,
+    output logic signed [7:0] mul_lhs_o [0:7],
+    output logic signed [7:0] mul_rhs_o [0:7],
+    input  logic signed [15:0] mul_product_i [0:7]
 );
   import router_ports_pkg::*;
 
@@ -49,11 +53,17 @@ module mfu_alu_attention #(
   localparam logic signed [31:0] SCORE_SAT_MIN = -32'sd128;
   localparam logic signed [31:0] NEG_INF_Q4 = -32'sd2147483647;
 
-  typedef enum logic [2:0] {
+  typedef enum logic [3:0] {
     ATT_IDLE,
     ATT_SCORE_K,
+    ATT_SCORE_MUL,
+    ATT_SCORE_COMMIT,
     ATT_UPDATE_SOFTMAX,
+    ATT_UPDATE_MUL,
+    ATT_UPDATE_COMMIT,
     ATT_VALUE_V,
+    ATT_VALUE_MUL,
+    ATT_VALUE_COMMIT,
     ATT_RESULT
   } attention_state_e;
 
@@ -72,6 +82,7 @@ module mfu_alu_attention #(
   logic [16:0] flit_start_idx_q;
   logic [16:0] flit_end_idx_q;
   logic [15:0] token_idx_q;
+  logic [31:0] token_base_addr_q;
   logic [15:0] k_base_idx_q;
   logic [4:0] task_idx_q;
   logic [DATA_W-1:0] k_data_q;
@@ -104,6 +115,7 @@ module mfu_alu_attention #(
   logic score_has_next_data;
   logic [15:0] score_next_base_idx;
   logic [31:0] token_base_addr_full;
+  logic [31:0] token_base_addr_next;
   logic [31:0] score_read_addr_full;
   logic [31:0] value_read_addr_full;
   logic [31:0] value_next_read_addr_full;
@@ -116,12 +128,13 @@ module mfu_alu_attention #(
   logic signed [31:0] score_sum_with_data;
   logic signed [31:0] score_sat;
   logic [7:0] score_sat_byte;
-  logic signed [31:0] query_q4;
-  logic signed [31:0] key_q4;
   logic signed [31:0] product_q8;
   logic signed [31:0] rounded_q4;
   logic [15:0] score_dim_idx;
   logic [K_DIM_IDX_W-1:0] score_query_idx;
+  logic signed [15:0] mul_product_q [0:7];
+  logic signed [7:0] mul_lhs_comb [0:7];
+  logic signed [7:0] mul_rhs_comb [0:7];
 
   logic signed [31:0] update_new_max;
   logic signed [31:0] update_old_scale;
@@ -158,8 +171,10 @@ module mfu_alu_attention #(
   integer reset_vc_idx;
   integer reset_dim_idx;
   integer reset_task_idx;
+  integer reset_mul_idx;
   integer query_lane_idx;
   integer score_lane_idx;
+  integer mul_lane_idx;
 
   assign is_attention_op = op_i.is_attention;
   assign head_like = flit_is_head_like(pkt_meta_i.flit_kind);
@@ -185,15 +200,16 @@ module mfu_alu_attention #(
 
   assign score_next_base_idx = k_base_idx_q + {10'd0, DATA_BYTES_Q};
   assign score_has_next_data =
-      (state_q == ATT_SCORE_K) && compute_en_i && (score_next_base_idx < k_dim_q);
-  assign token_base_addr_full = {16'd0, token_idx_q} * {16'd0, token_stride_q};
+      (state_q == ATT_SCORE_COMMIT) && compute_en_i && (score_next_base_idx < k_dim_q);
+  assign token_base_addr_full = token_base_addr_q;
+  assign token_base_addr_next = token_base_addr_q + {16'd0, token_stride_q};
   assign score_read_addr_full = token_base_addr_full + {16'd0, score_next_base_idx};
   assign task_idx_next = {1'b0, task_idx_q} + 6'd1;
   assign has_next_task = task_idx_next < task_count_q;
   assign value_has_next_task =
-      (state_q == ATT_VALUE_V) && compute_en_i && has_next_task;
+      (state_q == ATT_VALUE_COMMIT) && compute_en_i && has_next_task;
   assign value_last_task =
-      (state_q == ATT_VALUE_V) && compute_en_i && !value_has_next_task;
+      (state_q == ATT_VALUE_COMMIT) && compute_en_i && !value_has_next_task;
   assign token_has_next = (token_idx_q + 16'd1) < active_tokens_q;
   assign task_id_current =
       task_ids_flat_q[task_idx_q * TASK_ID_W +: TASK_ID_W];
@@ -204,8 +220,7 @@ module mfu_alu_attention #(
       token_base_addr_full + {16'd0, k_dim_q} + {16'd0, task_id_current};
   assign value_next_read_addr_full =
       token_base_addr_full + {16'd0, k_dim_q} + {16'd0, task_id_next};
-  assign next_token_read_addr_full =
-      ({16'd0, token_idx_q} + 32'd1) * {16'd0, token_stride_q};
+  assign next_token_read_addr_full = token_base_addr_next;
 
   always_comb begin : proc_token_capacity
     token_stride_supported = 1'b1;
@@ -239,7 +254,7 @@ module mfu_alu_attention #(
     end else if (score_has_next_data) begin
       data_req_valid = 1'b1;
       data_req_full_addr = score_read_addr_full;
-    end else if ((state_q == ATT_UPDATE_SOFTMAX) && compute_en_i &&
+    end else if ((state_q == ATT_UPDATE_COMMIT) && compute_en_i &&
                  (task_count_q != 6'd0)) begin
       data_req_valid = 1'b1;
       data_req_full_addr = value_read_addr_full;
@@ -249,7 +264,7 @@ module mfu_alu_attention #(
     end else if (value_last_task && token_has_next) begin
       data_req_valid = 1'b1;
       data_req_full_addr = next_token_read_addr_full;
-    end else if ((state_q == ATT_UPDATE_SOFTMAX) && compute_en_i &&
+    end else if ((state_q == ATT_UPDATE_COMMIT) && compute_en_i &&
                  (task_count_q == 6'd0) && token_has_next) begin
       data_req_valid = 1'b1;
       data_req_full_addr = next_token_read_addr_full;
@@ -263,38 +278,60 @@ module mfu_alu_attention #(
   assign data_req_o.valid = data_req_valid;
   assign data_req_o.bank_sel = 1'b1;
   assign data_req_o.addr = data_req_addr;
+  assign mul_req_o =
+      (state_q == ATT_SCORE_MUL) ||
+      (state_q == ATT_UPDATE_MUL) ||
+      (state_q == ATT_VALUE_MUL);
+  assign mul_lhs_o = mul_lhs_comb;
+  assign mul_rhs_o = mul_rhs_comb;
+
+  always_comb begin : proc_mul_operands
+    score_dim_idx = 16'd0;
+    score_query_idx = '0;
+    for (mul_lane_idx = 0; mul_lane_idx < 8; mul_lane_idx = mul_lane_idx + 1) begin
+      mul_lhs_comb[mul_lane_idx] = 8'sd0;
+      mul_rhs_comb[mul_lane_idx] = 8'sd0;
+    end
+
+    if (state_q == ATT_SCORE_MUL) begin
+      for (mul_lane_idx = 0; mul_lane_idx < DATA_BYTES; mul_lane_idx = mul_lane_idx + 1) begin
+        score_dim_idx = k_base_idx_q + 16'(mul_lane_idx);
+        score_query_idx = score_dim_idx[K_DIM_IDX_W-1:0];
+        if (score_dim_idx < k_dim_q) begin
+          mul_lhs_comb[mul_lane_idx] =
+              $signed(query_q[ctx_q.stream_port][ctx_q.stream_vc][score_query_idx]);
+          mul_rhs_comb[mul_lane_idx] =
+              $signed(k_data_q[mul_lane_idx * 8 +: 8]);
+        end
+      end
+    end else if (state_q == ATT_UPDATE_MUL) begin
+      mul_lhs_comb[0] = running_sum_q[7:0];
+      mul_rhs_comb[0] = update_old_scale[7:0];
+    end else if (state_q == ATT_VALUE_MUL) begin
+      mul_lhs_comb[0] = output_accum_q[task_idx_q][7:0];
+      mul_rhs_comb[0] = old_scale_q[7:0];
+      mul_lhs_comb[1] = token_exp_q[7:0];
+      mul_rhs_comb[1] = value_byte_q4[7:0];
+    end
+  end
 
   always_comb begin : proc_score_datapath
     score_data_sum = 32'sd0;
     score_sum_with_data = score_accum_q;
     score_sat = score_accum_q;
     score_sat_byte = 8'd0;
-    query_q4 = 32'sd0;
-    key_q4 = 32'sd0;
     product_q8 = 32'sd0;
     rounded_q4 = 32'sd0;
-    score_dim_idx = 16'd0;
-    score_query_idx = '0;
 
     for (score_lane_idx = 0; score_lane_idx < DATA_BYTES;
          score_lane_idx = score_lane_idx + 1) begin
-      score_dim_idx = k_base_idx_q + 16'(score_lane_idx);
-      score_query_idx = score_dim_idx[K_DIM_IDX_W-1:0];
-      if (score_dim_idx < k_dim_q) begin
-        query_q4 =
-            {{24{query_q[ctx_q.stream_port][ctx_q.stream_vc][score_query_idx][7]}},
-             query_q[ctx_q.stream_port][ctx_q.stream_vc][score_query_idx]};
-        key_q4 =
-            {{24{k_data_q[score_lane_idx * 8 + 7]}},
-             k_data_q[score_lane_idx * 8 +: 8]};
-        product_q8 = query_q4 * key_q4;
-        if (product_q8 >= 32'sd0) begin
-          rounded_q4 = (product_q8 + 32'sd8) >>> 4;
-        end else begin
-          rounded_q4 = -(((-product_q8) + 32'sd8) >>> 4);
-        end
-        score_data_sum = score_data_sum + rounded_q4;
+      product_q8 = {{16{mul_product_q[score_lane_idx][15]}}, mul_product_q[score_lane_idx]};
+      if (product_q8 >= 32'sd0) begin
+        rounded_q4 = (product_q8 + 32'sd8) >>> 4;
+      end else begin
+        rounded_q4 = -(((-product_q8) + 32'sd8) >>> 4);
       end
+      score_data_sum = score_data_sum + rounded_q4;
     end
 
     score_sum_with_data = score_accum_q + score_data_sum;
@@ -587,7 +624,6 @@ module mfu_alu_attention #(
       8'hfd: update_dpi_tmp = 32'sd13;
       8'hfe: update_dpi_tmp = 32'sd14;
       8'hff: update_dpi_tmp = 32'sd15;
-      default: update_dpi_tmp = 32'sd0;
     endcase
 `endif
     if (update_dpi_tmp > 127) begin
@@ -860,7 +896,6 @@ module mfu_alu_attention #(
       8'hfd: update_dpi_tmp = 32'sd13;
       8'hfe: update_dpi_tmp = 32'sd14;
       8'hff: update_dpi_tmp = 32'sd15;
-      default: update_dpi_tmp = 32'sd0;
     endcase
 `endif
     if (update_dpi_tmp > 127) begin
@@ -871,7 +906,7 @@ module mfu_alu_attention #(
       update_token_exp = update_dpi_tmp;
     end
 
-    update_product_q8 = running_sum_q * update_old_scale;
+    update_product_q8 = {{16{mul_product_q[0][15]}}, mul_product_q[0]};
     if (update_product_q8 >= 32'sd0) begin
       update_rounded_q4 = (update_product_q8 + 32'sd8) >>> 4;
     end else begin
@@ -906,7 +941,7 @@ module mfu_alu_attention #(
     value_sat_byte = 8'd0;
     value_accum_next = output_accum_q[task_idx_q];
 
-    value_product_q8 = output_accum_q[task_idx_q] * old_scale_q;
+    value_product_q8 = {{16{mul_product_q[0][15]}}, mul_product_q[0]};
     if (value_product_q8 >= 32'sd0) begin
       value_rounded_q4 = (value_product_q8 + 32'sd8) >>> 4;
     end else begin
@@ -914,7 +949,7 @@ module mfu_alu_attention #(
     end
     value_old_scaled = value_rounded_q4;
 
-    value_product_q8 = token_exp_q * value_byte_q4;
+    value_product_q8 = {{16{mul_product_q[1][15]}}, mul_product_q[1]};
     if (value_product_q8 >= 32'sd0) begin
       value_rounded_q4 = (value_product_q8 + 32'sd8) >>> 4;
     end else begin
@@ -946,6 +981,7 @@ module mfu_alu_attention #(
       flit_start_idx_q <= '0;
       flit_end_idx_q <= '0;
       token_idx_q <= '0;
+      token_base_addr_q <= 32'd0;
       k_base_idx_q <= '0;
       task_idx_q <= '0;
       k_data_q <= '0;
@@ -958,6 +994,9 @@ module mfu_alu_attention #(
       result_flit_q <= '0;
       result_meta_q <= '0;
       result_valid_q <= 1'b0;
+      for (reset_mul_idx = 0; reset_mul_idx < 8; reset_mul_idx = reset_mul_idx + 1) begin
+        mul_product_q[reset_mul_idx] <= '0;
+      end
       for (reset_task_idx = 0; reset_task_idx < MAX_TASKS;
            reset_task_idx = reset_task_idx + 1) begin
         output_accum_q[reset_task_idx] <= 32'sd0;
@@ -989,6 +1028,7 @@ module mfu_alu_attention #(
         result_flit_q <= pkt_flit_i;
         result_meta_q <= pkt_meta_i;
         token_idx_q <= 16'd0;
+        token_base_addr_q <= 32'd0;
         k_base_idx_q <= 16'd0;
         task_idx_q <= 5'd0;
         score_accum_q <= 32'sd0;
@@ -1034,16 +1074,35 @@ module mfu_alu_attention #(
       if (compute_en_i) begin
         unique case (state_q)
           ATT_SCORE_K: begin
+            state_q <= ATT_SCORE_MUL;
+          end
+          ATT_SCORE_MUL: begin
+            state_q <= ATT_SCORE_COMMIT;
+            for (reset_mul_idx = 0; reset_mul_idx < 8; reset_mul_idx = reset_mul_idx + 1) begin
+              mul_product_q[reset_mul_idx] <= mul_product_i[reset_mul_idx];
+            end
+          end
+          ATT_SCORE_COMMIT: begin
             if (score_has_next_data) begin
               score_accum_q <= score_sum_with_data;
               k_base_idx_q <= score_next_base_idx;
               k_data_q <= data_rsp_i.rdata;
+              state_q <= ATT_SCORE_MUL;
             end else begin
               score_accum_q <= score_sat;
               state_q <= ATT_UPDATE_SOFTMAX;
             end
           end
           ATT_UPDATE_SOFTMAX: begin
+            state_q <= ATT_UPDATE_MUL;
+          end
+          ATT_UPDATE_MUL: begin
+            state_q <= ATT_UPDATE_COMMIT;
+            for (reset_mul_idx = 0; reset_mul_idx < 8; reset_mul_idx = reset_mul_idx + 1) begin
+              mul_product_q[reset_mul_idx] <= mul_product_i[reset_mul_idx];
+            end
+          end
+          ATT_UPDATE_COMMIT: begin
             running_max_q <= update_new_max;
             running_sum_q <= update_running_sum;
             old_scale_q <= update_old_scale;
@@ -1056,6 +1115,7 @@ module mfu_alu_attention #(
               state_q <= ATT_VALUE_V;
             end else if (token_has_next) begin
               token_idx_q <= token_idx_q + 16'd1;
+              token_base_addr_q <= token_base_addr_next;
               k_base_idx_q <= 16'd0;
               score_accum_q <= 32'sd0;
               k_data_q <= data_rsp_i.rdata;
@@ -1065,6 +1125,15 @@ module mfu_alu_attention #(
             end
           end
           ATT_VALUE_V: begin
+            state_q <= ATT_VALUE_MUL;
+          end
+          ATT_VALUE_MUL: begin
+            state_q <= ATT_VALUE_COMMIT;
+            for (reset_mul_idx = 0; reset_mul_idx < 8; reset_mul_idx = reset_mul_idx + 1) begin
+              mul_product_q[reset_mul_idx] <= mul_product_i[reset_mul_idx];
+            end
+          end
+          ATT_VALUE_COMMIT: begin
             output_accum_q[task_idx_q] <= value_accum_next;
             if (value_task_in_flit) begin
               result_flit_q[value_target_lane * 8 +: 8] <= value_sat_byte;
@@ -1072,8 +1141,10 @@ module mfu_alu_attention #(
             if (value_has_next_task) begin
               task_idx_q <= task_idx_next[4:0];
               v_data_q <= data_rsp_i.rdata;
+              state_q <= ATT_VALUE_V;
             end else if (token_has_next) begin
               token_idx_q <= token_idx_q + 16'd1;
+              token_base_addr_q <= token_base_addr_next;
               k_base_idx_q <= 16'd0;
               task_idx_q <= 5'd0;
               score_accum_q <= 32'sd0;

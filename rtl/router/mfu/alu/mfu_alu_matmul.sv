@@ -29,7 +29,11 @@ module mfu_alu_matmul #(
     output logic result_valid_o,
     output logic [FLIT_W-1:0] result_flit_o,
     output router_ports_pkg::flit_meta_t result_meta_o,
-    output logic signed [31:0] result_scalar_o
+    output logic signed [31:0] result_scalar_o,
+    output logic mul_req_o,
+    output logic signed [7:0] mul_lhs_o [0:7],
+    output logic signed [7:0] mul_rhs_o [0:7],
+    input  logic signed [15:0] mul_product_i [0:7]
 );
   import router_ports_pkg::*;
 
@@ -77,7 +81,6 @@ module mfu_alu_matmul #(
   logic [31:0] compute_weight_addr_full;
   logic signed [7:0] data_lhs_s8 [DATA_ELEMS];
   logic signed [7:0] data_rhs_s8 [DATA_ELEMS];
-  logic signed [15:0] product_s16 [DATA_ELEMS];
   logic signed [31:0] product_q8 [DATA_ELEMS];
   logic signed [31:0] rounded_q4 [DATA_ELEMS];
   logic signed [ACC_W-1:0] data_contrib [DATA_ELEMS];
@@ -153,6 +156,9 @@ module mfu_alu_matmul #(
   end
 
   assign data_req_o.addr = weight_addr_clamped;
+  assign mul_req_o = data_valid;
+  assign mul_lhs_o = data_lhs_s8;
+  assign mul_rhs_o = data_rhs_s8;
 
   always_comb begin : proc_data_operand
     compute_input_idx =
@@ -195,10 +201,8 @@ module mfu_alu_matmul #(
           data_lhs[data_product_idx*DATA_ELEM_W +: DATA_ELEM_W];
       data_rhs_s8[data_product_idx] =
           data_rhs[data_product_idx*DATA_ELEM_W +: DATA_ELEM_W];
-      product_s16[data_product_idx] =
-          data_lhs_s8[data_product_idx] * data_rhs_s8[data_product_idx];
       product_q8[data_product_idx] =
-          {{16{product_s16[data_product_idx][15]}}, product_s16[data_product_idx]};
+          {{16{mul_product_i[data_product_idx][15]}}, mul_product_i[data_product_idx]};
       rounded_q4[data_product_idx] = 32'sd0;
 
       if (product_q8[data_product_idx] >= 32'sd0) begin

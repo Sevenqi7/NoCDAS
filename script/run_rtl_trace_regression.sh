@@ -11,7 +11,7 @@ COMPARE_MODE=""
 
 usage() {
   cat <<USAGE
-Usage: $0 [--quant-cnoc] [--strict-attention] [--model toy|synthetic-cnoc]
+Usage: $0 [--quant-cnoc] [--strict-attention] [--model toy|synthetic-cnoc|medium-synthetic-cnoc]
           [--compare route|quant|strict] [--build-dir DIR]
 
   --quant-cnoc  Use a separate CNOC_QUANT_GOLDEN=ON build and compare
@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --model)
       if [[ $# -lt 2 ]]; then
-        echo "[ERROR] --model requires toy or synthetic-cnoc." >&2
+        echo "[ERROR] --model requires toy, synthetic-cnoc, or medium-synthetic-cnoc." >&2
         usage
         exit 2
       fi
@@ -77,7 +77,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${MODEL}" in
-  toy|synthetic-cnoc) ;;
+  toy|synthetic-cnoc|medium-synthetic-cnoc) ;;
   *)
     echo "[ERROR] Unsupported model: ${MODEL}" >&2
     usage
@@ -126,7 +126,7 @@ fi
 
 TRACE_DIR="${BUILD_DIR}/trace_regression"
 LOCK_DIR="${TRACE_DIR}.lock"
-MODEL_DIR="${TRACE_DIR}/${MODEL}_model"
+MODEL_DIR="${TRACE_DIR}/m"
 
 mkdir -p "${TRACE_DIR}"
 
@@ -137,19 +137,71 @@ done
 trap 'rmdir "${LOCK_DIR}"' EXIT
 
 if [[ "${QUANT_CNOC}" == "1" ]]; then
-  cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCNOC_QUANT_GOLDEN=ON
+  cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCNOC_QUANT_GOLDEN=ON -DENABLE_CNOC_MFU=ON
 else
-  cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCNOC_QUANT_GOLDEN=OFF
+  cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCNOC_QUANT_GOLDEN=OFF -DENABLE_CNOC_MFU=OFF
 fi
 cmake --build "${BUILD_DIR}" -j"$(nproc)"
 
 MODEL_ARGS=()
-if [[ "${MODEL}" == "synthetic-cnoc" ]]; then
+if [[ "${MODEL}" == "synthetic-cnoc" || "${MODEL}" == "medium-synthetic-cnoc" ]]; then
   mkdir -p "${MODEL_DIR}"
-  MODEL_FILE="${MODEL_DIR}/synthetic_cnoc_model.txt"
-  WEIGHT_FILE="${MODEL_DIR}/synthetic_cnoc_weight.txt"
-  INPUT_FILE="${MODEL_DIR}/synthetic_cnoc_input.txt"
+  MODEL_FILE="${MODEL_DIR}/mdl.txt"
+  WEIGHT_FILE="${MODEL_DIR}/w.txt"
+  INPUT_FILE="${MODEL_DIR}/in.txt"
 
+  if [[ "${MODEL}" == "medium-synthetic-cnoc" ]]; then
+    cat > "${MODEL_FILE}" <<'MODEL_EOF'
+Input 16 1 1
+Embedding 32 16
+MatMul 16 64
+MatMul 64 128
+GeGLU 64
+MatMul 64 64
+Add 64 1
+MatMul 64 16
+MODEL_EOF
+
+    : > "${WEIGHT_FILE}"
+    for row in $(seq 0 31); do
+      for col in $(seq 0 15); do
+        awk "BEGIN { printf \"%.4f%s\", ((((${row}+${col}) % 7) - 3) / 16.0), (${col} == 15) ? \"\\n\" : \" \" }" \
+          >> "${WEIGHT_FILE}"
+      done
+    done
+    for row in $(seq 0 63); do
+      for col in $(seq 0 15); do
+        awk "BEGIN { printf \"%.4f \", ((((${row}*3+${col}) % 9) - 4) / 16.0) }" \
+          >> "${WEIGHT_FILE}"
+      done
+      printf '0.0000\n' >> "${WEIGHT_FILE}"
+    done
+    for row in $(seq 0 127); do
+      for col in $(seq 0 63); do
+        awk "BEGIN { printf \"%.4f \", ((((${row}+${col}*5) % 11) - 5) / 32.0) }" \
+          >> "${WEIGHT_FILE}"
+      done
+      printf '0.0000\n' >> "${WEIGHT_FILE}"
+    done
+    for row in $(seq 0 63); do
+      for col in $(seq 0 63); do
+        awk "BEGIN { printf \"%.4f \", (${row} == ${col}) ? 0.5000 : ((((${row}+${col}) % 5) - 2) / 64.0) }" \
+          >> "${WEIGHT_FILE}"
+      done
+      printf '0.0000\n' >> "${WEIGHT_FILE}"
+    done
+    for row in $(seq 0 15); do
+      for col in $(seq 0 63); do
+        awk "BEGIN { printf \"%.4f \", ((((${row}*7+${col}) % 13) - 6) / 64.0) }" \
+          >> "${WEIGHT_FILE}"
+      done
+      printf '0.0000\n' >> "${WEIGHT_FILE}"
+    done
+
+    cat > "${INPUT_FILE}" <<'INPUT_EOF'
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+INPUT_EOF
+  else
   cat > "${MODEL_FILE}" <<'MODEL_EOF'
 Input 4 1 1
 Embedding 8 4
@@ -209,6 +261,7 @@ WEIGHT_EOF
   cat > "${INPUT_FILE}" <<'INPUT_EOF'
 1 2 3 4
 INPUT_EOF
+  fi
 
   MODEL_ARGS=(-NNmodel "${MODEL_FILE}" -NNweight "${WEIGHT_FILE}" -NNinput "${INPUT_FILE}")
 fi

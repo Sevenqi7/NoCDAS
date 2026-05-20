@@ -1,8 +1,9 @@
 // Description: Router input port with one FIFO per VC.
 //              The unit accepts flits from the environment, selects one
 //              non-empty VC in round-robin order, computes the requested output
-//              port, and pops the selected VC when the switch allocator grants
-//              the transfer.
+//              port, and stores accepted candidates in a local two-entry issue
+//              queue.  The input FIFO itself still pops only after output
+//              commit, preserving wormhole backpressure correctness.
 
 module input_unit #(
     parameter int VC_NUM = 8,
@@ -16,11 +17,13 @@ module input_unit #(
     input  logic [2:0] rinport_x_cur_i,
     input  logic [2:0] rinport_y_cur_i,
     input  logic [2:0] rinport_channel_i,
+    input  logic issue_pop_i,
     output router_ports_pkg::flit_meta_t rinport_raw_meta_o,
     output router_ports_pkg::route_path_t rinport_route_path_o,
     output logic rinport_may_need_mfu_o,
     output router_ports_pkg::router_traffic_class_e rinport_traffic_class_o,
     output router_ports_pkg::rinport_issue_t rinport_issue_o,
+    output router_ports_pkg::router_pipe_entry_t issue_entry_o,
     output router_ports_pkg::rinport_flow_t  rinport_flow_o
 );
   import router_ports_pkg::*;
@@ -43,6 +46,8 @@ module input_unit #(
   logic selected_valid_d;
   logic issue_accept_fire;
   logic commit_fire;
+  logic issue_queue_push;
+  logic issue_queue_pop;
   logic flit_valid;
   logic [FLIT_W-1:0] issue_flit;
   flit_meta_t issue_meta;
@@ -67,10 +72,19 @@ module input_unit #(
   router_traffic_class_e issue_msg_traffic_class;
   logic input_accept;
   logic issue_has_flit;
+  router_pipe_entry_t issue_queue_q [2];
+  router_pipe_entry_t issue_queue_d [2];
+  router_pipe_entry_t issue_push_entry;
+  logic [1:0] issue_count_q;
+  logic [1:0] issue_count_d;
+  logic issue_head_ptr_q;
+  logic issue_head_ptr_d;
+  logic issue_tail_ptr_q;
+  logic issue_tail_ptr_d;
   int issue_route_process_ptr_idx;
   int issue_route_process_len_idx;
   int issue_route_seq_base;
-  int rr_ptr_int;
+  int unsigned rr_ptr_int;
 
   int unsigned search_idx;
   int unsigned vc_idx;
@@ -126,11 +140,21 @@ module input_unit #(
       selected_vc_q <= '0;
       rr_ptr_q <= '0;
       inflight_q <= '0;
+      issue_queue_q[0] <= '0;
+      issue_queue_q[1] <= '0;
+      issue_count_q <= '0;
+      issue_head_ptr_q <= 1'b0;
+      issue_tail_ptr_q <= 1'b0;
       for (route_vc_idx = 0; route_vc_idx < VC_NUM; route_vc_idx = route_vc_idx + 1) begin
         route_path_q[route_vc_idx] <= '0;
       end
     end else begin
       inflight_q <= inflight_d;
+      issue_queue_q[0] <= issue_queue_d[0];
+      issue_queue_q[1] <= issue_queue_d[1];
+      issue_count_q <= issue_count_d;
+      issue_head_ptr_q <= issue_head_ptr_d;
+      issue_tail_ptr_q <= issue_tail_ptr_d;
 
       if (selected_valid_d)
         selected_vc_q <= selected_vc_d;
@@ -242,7 +266,7 @@ module input_unit #(
     commit_fire = rinport_ctrl_i.commit_valid;
     if (issue_has_flit) begin
       issue_valid = 1'b1;
-      issue_accept_fire = rinport_ctrl_i.issue_accept;
+      issue_accept_fire = issue_queue_push;
     end
 
     pop_vec = '0;
@@ -258,6 +282,48 @@ module input_unit #(
     if (issue_accept_fire) begin
       inflight_d[selected_vc_q] = 1'b1;
     end
+  end
+
+  always_comb begin : proc_issue_queue_next
+    issue_queue_d[0] = issue_queue_q[0];
+    issue_queue_d[1] = issue_queue_q[1];
+    issue_count_d = issue_count_q;
+    issue_head_ptr_d = issue_head_ptr_q;
+    issue_tail_ptr_d = issue_tail_ptr_q;
+    issue_queue_push = 1'b0;
+    issue_queue_pop = issue_pop_i;
+    issue_push_entry = '0;
+
+    if (issue_has_flit && (issue_count_q < 2'd2)) begin
+      issue_queue_push = 1'b1;
+      issue_push_entry.valid = 1'b1;
+      issue_push_entry.flit = issue_flit;
+      issue_push_entry.meta = issue_meta;
+      issue_push_entry.route_path = issue_route_path;
+      issue_push_entry.src_port = rinport_channel_i;
+      issue_push_entry.src_vc = issue_sel_vc;
+      issue_push_entry.route_sel = issue_route_sel;
+      issue_push_entry.dst_vc = '0;
+      issue_push_entry.traffic_class = issue_traffic_class;
+      issue_push_entry.head_like = issue_head_like;
+      issue_push_entry.tail_like = issue_tail_like;
+      issue_push_entry.may_need_mfu = issue_may_need_mfu;
+      issue_push_entry.reserved_vc = 1'b0;
+      issue_queue_d[issue_tail_ptr_q] = issue_push_entry;
+    end
+
+    if (issue_queue_push) begin
+      issue_tail_ptr_d = ~issue_tail_ptr_q;
+    end
+    if (issue_queue_pop) begin
+      issue_head_ptr_d = ~issue_head_ptr_q;
+    end
+
+    case ({issue_queue_push, issue_queue_pop})
+      2'b10: issue_count_d = issue_count_q + 2'd1;
+      2'b01: issue_count_d = issue_count_q - 2'd1;
+      default: issue_count_d = issue_count_q;
+    endcase
   end
 
 
@@ -302,6 +368,10 @@ module input_unit #(
   // FIFO pop remains controlled internally by the commit sideband.
   assign rinport_issue_o.pop_fire = 1'b0;
   assign rinport_issue_o.sel_vc = issue_sel_vc;
+  always_comb begin : proc_issue_entry_output
+    issue_entry_o = issue_queue_q[issue_head_ptr_q];
+    issue_entry_o.valid = (issue_count_q != 2'd0);
+  end
   assign rinport_raw_meta_o = issue_meta;
   assign rinport_route_path_o = issue_route_path;
   assign rinport_may_need_mfu_o = issue_may_need_mfu;
@@ -319,6 +389,14 @@ module input_unit #(
 
       if (issue_accept_fire && !issue_has_flit) begin
         $error("input_unit: accepted an empty/invalid selected VC into pipeline");
+      end
+
+      if (issue_queue_pop && (issue_count_q == 2'd0)) begin
+        $error("input_unit: attempted to pop an empty issue queue");
+      end
+
+      if (issue_queue_push && (issue_count_q == 2'd2)) begin
+        $error("input_unit: attempted to push a full issue queue");
       end
 
       // The environment may only inject into a physically implemented VC.  The

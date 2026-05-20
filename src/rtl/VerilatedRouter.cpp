@@ -592,6 +592,26 @@ private:
         static_cast<int>(vc_id),
         rec.src_cpp_port,
         rec.src_vc});
+    if (rec.src_cpp_port >= 0 && rec.src_cpp_port < owner_->port_num) {
+      RInPort* src_in = owner_->in_port_list[rec.src_cpp_port];
+      if (src_in != nullptr &&
+          rec.src_vc >= 0 &&
+          rec.src_vc < static_cast<int>(src_in->state.size()) &&
+          rec.flit != nullptr) {
+        const bool head_like = (rec.flit->type == 0 || rec.flit->type == 10);
+        const bool tail_like = (rec.flit->type == 1 || rec.flit->type == 10);
+        if (head_like && !tail_like) {
+          if (rec.src_vc < static_cast<int>(src_in->out_vc.size())) {
+            src_in->out_vc[rec.src_vc] = static_cast<int>(vc_id);
+          }
+        } else if (tail_like) {
+          src_in->state[rec.src_vc] = 0;
+          if (rec.src_vc < static_cast<int>(src_in->out_vc.size())) {
+            src_in->out_vc[rec.src_vc] = -1;
+          }
+        }
+      }
+    }
     token_to_flit_.erase(it);
   }
 
@@ -669,24 +689,6 @@ private:
       next->state[pending.target_vc] = 2;
     }
 
-    if (pending.src_cpp_port >= 0 && pending.src_cpp_port < owner_->port_num) {
-      RInPort* src_in = owner_->in_port_list[pending.src_cpp_port];
-      if (src_in != nullptr &&
-          pending.src_vc >= 0 &&
-          pending.src_vc < static_cast<int>(src_in->state.size())) {
-        if (head_like && !tail_like) {
-          if (pending.src_vc < static_cast<int>(src_in->out_vc.size())) {
-            src_in->out_vc[pending.src_vc] = pending.target_vc;
-          }
-        } else if (tail_like) {
-          src_in->state[pending.src_vc] = 0;
-          if (pending.src_vc < static_cast<int>(src_in->out_vc.size())) {
-            src_in->out_vc[pending.src_vc] = -1;
-          }
-        }
-      }
-    }
-
     // Successfully enqueued to the next hop; update utilization stats and remove from pending.
     owner_->port_total_utilization++;
     if (pending.cpp_out_port <= 3) {
@@ -695,12 +697,29 @@ private:
     return true;
   }
 
-  // Checks pending output flits for next-hop readiness and enqueues them if possible; keeps the rest pending.
+  // Checks pending output flits for next-hop readiness and enqueues them if possible.
+  // Preserve ordering within each source VC, but allow unrelated source VCs to
+  // pass a blocked new head so older tails can release their destination VCs.
   void drainPendingOutputs() {
+    std::array<std::array<bool, RTL_VC_NUM>, RTL_PORTS> blocked_source_vc{};
     for (auto it = pending_outputs_.begin(); it != pending_outputs_.end();) {
+      if (it->src_cpp_port >= 0 &&
+          it->src_cpp_port < RTL_PORTS &&
+          it->src_vc >= 0 &&
+          it->src_vc < RTL_VC_NUM &&
+          blocked_source_vc[it->src_cpp_port][it->src_vc]) {
+        ++it;
+        continue;
+      }
       if (enqueueToNextHop(*it)) {
         it = pending_outputs_.erase(it);
       } else {
+        if (it->src_cpp_port >= 0 &&
+            it->src_cpp_port < RTL_PORTS &&
+            it->src_vc >= 0 &&
+            it->src_vc < RTL_VC_NUM) {
+          blocked_source_vc[it->src_cpp_port][it->src_vc] = true;
+        }
         ++it;
       }
     }

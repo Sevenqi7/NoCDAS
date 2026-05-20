@@ -27,12 +27,14 @@ module mfu_writeback #(
 
   logic [4:0] opcode;
   logic [4:0] data_lane;
+  logic [7:0] data_lane_byte_offset;
 
   always_comb begin
     emit_flit_o = pkt_flit_i;
     emit_meta_o = pkt_meta_i;
     opcode = pkt_meta_i.opcode;
     data_lane = pkt_meta_i.data_offset[4:0];
+    data_lane_byte_offset = {data_lane, 3'b000};
 
     // Only type5 compute packets modify outgoing payload data.  Type4 packets
     // have already committed storage side effects and forward their payload
@@ -62,7 +64,7 @@ module mfu_writeback #(
           emit_flit_o = alu_flit_i;
           emit_meta_o = alu_meta_i;
 `ifdef ROUTER_ENABLE_COSIM
-          emit_meta_o.cosim.data_q = emit_flit_o[{data_lane, 3'b000} +: 8];
+          emit_meta_o.cosim.data_q = emit_flit_o[data_lane_byte_offset +: 8];
 `endif
         end
         OP_ATTENTION: begin
@@ -71,7 +73,7 @@ module mfu_writeback #(
           emit_flit_o = alu_flit_i;
           emit_meta_o = alu_meta_i;
 `ifdef ROUTER_ENABLE_COSIM
-          emit_meta_o.cosim.data_q = emit_flit_o[{data_lane, 3'b000} +: 8];
+          emit_meta_o.cosim.data_q = emit_flit_o[data_lane_byte_offset +: 8];
 `endif
         end
         // Fallback single-lane writeback for simple scalar/experimental opcodes.

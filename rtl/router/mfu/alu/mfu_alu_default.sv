@@ -1,5 +1,8 @@
 // Description: Fallback leaf for the MFU ALU.  NONLINEAR_IMPL_DPI keeps the
 //              legacy DPI-C exp/div path; default mode uses local Q4.4 LUTs.
+//              This leaf is not on the MatMul/GeGLU/SwiGLU/Attention cNoC PPA
+//              path; its local exp*recip product is intentionally left as a
+//              documented follow-up item instead of sharing mfu_int8_mul8.
 
 module mfu_alu_default #(
     parameter int FLIT_W = router_ports_pkg::FLIT_W
@@ -27,6 +30,7 @@ module mfu_alu_default #(
   logic signed [31:0] scalar_tmp;
   logic signed [31:0] sat_tmp;
   logic [4:0] data_lane;
+  logic [7:0] data_lane_byte_offset;
   logic signed [31:0] exp_tmp;
   logic signed [31:0] recip_tmp;
   logic signed [31:0] lut_product_q8;
@@ -38,6 +42,7 @@ module mfu_alu_default #(
   flit_meta_t result_meta;
 
   assign data_lane = meta_i.data_offset[4:0];
+  assign data_lane_byte_offset = {data_lane, 3'b000};
   assign busy_o = 1'b0;
 
   always_comb begin : proc_default_result
@@ -315,7 +320,6 @@ module mfu_alu_default #(
         8'hfd: exp_tmp = 32'sd13;
         8'hfe: exp_tmp = 32'sd14;
         8'hff: exp_tmp = 32'sd15;
-        default: exp_tmp = 32'sd0;
       endcase
       case (scalar_b_i[7:0])
         8'h00: recip_tmp = 32'sd0;
@@ -574,7 +578,6 @@ module mfu_alu_default #(
         8'hfd: recip_tmp = -32'sd85;
         8'hfe: recip_tmp = -32'sd128;
         8'hff: recip_tmp = -32'sd128;
-        default: recip_tmp = 32'sd0;
       endcase
       lut_product_q8 = exp_tmp * recip_tmp;
       if (lut_product_q8 >= 32'sd0) begin
@@ -592,11 +595,11 @@ module mfu_alu_default #(
     end else begin
       scalar_tmp = sat_tmp;
     end
-    result_flit[data_lane * 8 +: 8] = scalar_tmp[7:0];
+    result_flit[data_lane_byte_offset +: 8] = scalar_tmp[7:0];
     result_meta = meta_i;
 
 `ifdef ROUTER_ENABLE_COSIM
-    result_meta.cosim.data_q = result_flit[{data_lane, 3'b000} +: 8];
+    result_meta.cosim.data_q = result_flit[data_lane_byte_offset +: 8];
 `endif
   end
 

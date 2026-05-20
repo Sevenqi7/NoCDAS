@@ -119,6 +119,7 @@ module cnoc_mfu #(
   logic [15:0] type4_kv_slot;
   logic [15:0] type4_kv_last_slot;
   logic type4_kv_has_ring_region;
+  logic [31:0] type4_kv_slot_base_addr;
   logic [31:0] type4_wr_addr_full;
   logic [5:0] type4_payload_bytes;
   logic [31:0] type4_bytes_to_sram_end_full;
@@ -169,15 +170,15 @@ module cnoc_mfu #(
     type4_kv_stride = (decoded_k_dim_q == 16'd0) ? 16'd1 : (decoded_k_dim_q << 1);
     type4_kv_stride_supported = 1'b1;
     case (type4_kv_stride)
-      16'd1:   type4_kv_max_tokens_raw = 16'(SRAM_DEPTH);
-      16'd2:   type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 1);
-      16'd4:   type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 2);
-      16'd8:   type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 3);
-      16'd16:  type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 4);
-      16'd32:  type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 5);
-      16'd64:  type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 6);
-      16'd128: type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 7);
-      16'd256: type4_kv_max_tokens_raw = 16'(SRAM_DEPTH >> 8);
+      16'd1:   type4_kv_max_tokens_raw = SRAM_DEPTH_U32[15:0];
+      16'd2:   type4_kv_max_tokens_raw = SRAM_DEPTH_U32[16:1];
+      16'd4:   type4_kv_max_tokens_raw = SRAM_DEPTH_U32[17:2];
+      16'd8:   type4_kv_max_tokens_raw = SRAM_DEPTH_U32[18:3];
+      16'd16:  type4_kv_max_tokens_raw = SRAM_DEPTH_U32[19:4];
+      16'd32:  type4_kv_max_tokens_raw = SRAM_DEPTH_U32[20:5];
+      16'd64:  type4_kv_max_tokens_raw = SRAM_DEPTH_U32[21:6];
+      16'd128: type4_kv_max_tokens_raw = SRAM_DEPTH_U32[22:7];
+      16'd256: type4_kv_max_tokens_raw = SRAM_DEPTH_U32[23:8];
       default: begin
         type4_kv_max_tokens_raw = 16'd1;
         type4_kv_stride_supported = 1'b0;
@@ -211,8 +212,21 @@ module cnoc_mfu #(
       type4_kv_slot_next = type4_kv_sink_limit;
     end
 
+    case (type4_kv_stride)
+      16'd1:   type4_kv_slot_base_addr = {16'd0, type4_kv_slot};
+      16'd2:   type4_kv_slot_base_addr = {15'd0, type4_kv_slot, 1'b0};
+      16'd4:   type4_kv_slot_base_addr = {14'd0, type4_kv_slot, 2'b00};
+      16'd8:   type4_kv_slot_base_addr = {13'd0, type4_kv_slot, 3'b000};
+      16'd16:  type4_kv_slot_base_addr = {12'd0, type4_kv_slot, 4'b0000};
+      16'd32:  type4_kv_slot_base_addr = {11'd0, type4_kv_slot, 5'b0_0000};
+      16'd64:  type4_kv_slot_base_addr = {10'd0, type4_kv_slot, 6'b00_0000};
+      16'd128: type4_kv_slot_base_addr = {9'd0, type4_kv_slot, 7'b000_0000};
+      16'd256: type4_kv_slot_base_addr = {8'd0, type4_kv_slot, 8'b0000_0000};
+      default: type4_kv_slot_base_addr = {16'd0, type4_kv_slot};
+    endcase
+
     if (type4_bank_sel) begin
-      type4_wr_addr_full = (type4_kv_slot * type4_kv_stride) + decoded_data_idx_q;
+      type4_wr_addr_full = type4_kv_slot_base_addr + decoded_data_idx_q;
     end else begin
       type4_wr_addr_full = decoded_data_idx_q;
     end

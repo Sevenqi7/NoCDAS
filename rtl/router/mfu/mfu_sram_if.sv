@@ -27,7 +27,7 @@ module mfu_sram_if #(
     output logic [ADDR_W-1:0] sram_rd_addr_o
 );
   localparam logic [4:0] OPCODE_ATTENTION = 5'd23;
-  integer byte_idx;
+  int unsigned byte_idx;
   logic [5:0] effective_store_bytes;
 
   always_comb begin

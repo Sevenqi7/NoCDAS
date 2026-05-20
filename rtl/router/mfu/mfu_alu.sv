@@ -31,6 +31,7 @@ module mfu_alu #(
   localparam logic [4:0] OP_SWIGLU    = 5'd21;
   localparam logic [4:0] OP_ATTENTION = 5'd23;
   localparam logic [4:0] OP_GEGLU     = 5'd24;
+  localparam int MUL_LANES = 8;
 
   logic signed [31:0] scalar_a;
   logic signed [31:0] scalar_b;
@@ -83,6 +84,24 @@ module mfu_alu #(
   logic result_valid_comb;
   logic result_busy_comb;
 
+  logic matmul_mul_req;
+  logic swiglu_mul_req;
+  logic geglu_mul_req;
+  logic attention_mul_req;
+  logic signed [7:0] matmul_mul_lhs [0:MUL_LANES-1];
+  logic signed [7:0] matmul_mul_rhs [0:MUL_LANES-1];
+  logic signed [7:0] swiglu_mul_lhs [0:MUL_LANES-1];
+  logic signed [7:0] swiglu_mul_rhs [0:MUL_LANES-1];
+  logic signed [7:0] geglu_mul_lhs [0:MUL_LANES-1];
+  logic signed [7:0] geglu_mul_rhs [0:MUL_LANES-1];
+  logic signed [7:0] attention_mul_lhs [0:MUL_LANES-1];
+  logic signed [7:0] attention_mul_rhs [0:MUL_LANES-1];
+  logic signed [7:0] shared_mul_lhs [0:MUL_LANES-1];
+  logic signed [7:0] shared_mul_rhs [0:MUL_LANES-1];
+  logic signed [15:0] shared_mul_product [0:MUL_LANES-1];
+
+  int unsigned mul_lane_idx;
+
   assign scalar_a = {{24{flit_i[{meta_i.data_offset[4:0], 3'b000} + 7]}},
                      flit_i[{meta_i.data_offset[4:0], 3'b000} +: 8]};
   assign scalar_b = {{24{data_rsp_i.rdata[7]}}, data_rsp_i.rdata[7:0]};
@@ -123,7 +142,11 @@ module mfu_alu #(
       .result_valid_o(matmul_valid),
       .result_flit_o(matmul_flit),
       .result_meta_o(matmul_meta),
-      .result_scalar_o(matmul_scalar)
+      .result_scalar_o(matmul_scalar),
+      .mul_req_o(matmul_mul_req),
+      .mul_lhs_o(matmul_mul_lhs),
+      .mul_rhs_o(matmul_mul_rhs),
+      .mul_product_i(shared_mul_product)
   );
 
   mfu_alu_add #(
@@ -159,7 +182,11 @@ module mfu_alu #(
       .valid_o(swiglu_valid),
       .result_flit_o(swiglu_flit),
       .result_meta_o(swiglu_meta),
-      .result_scalar_o(swiglu_scalar)
+      .result_scalar_o(swiglu_scalar),
+      .mul_req_o(swiglu_mul_req),
+      .mul_lhs_o(swiglu_mul_lhs),
+      .mul_rhs_o(swiglu_mul_rhs),
+      .mul_product_i(shared_mul_product)
   );
 
   mfu_alu_geglu #(
@@ -177,7 +204,11 @@ module mfu_alu #(
       .valid_o(geglu_valid),
       .result_flit_o(geglu_flit),
       .result_meta_o(geglu_meta),
-      .result_scalar_o(geglu_scalar)
+      .result_scalar_o(geglu_scalar),
+      .mul_req_o(geglu_mul_req),
+      .mul_lhs_o(geglu_mul_lhs),
+      .mul_rhs_o(geglu_mul_rhs),
+      .mul_product_i(shared_mul_product)
   );
 
   mfu_alu_attention #(
@@ -203,7 +234,11 @@ module mfu_alu #(
       .busy_o(attention_busy),
       .result_valid_o(attention_valid),
       .result_flit_o(attention_result_flit),
-      .result_meta_o(attention_result_meta)
+      .result_meta_o(attention_result_meta),
+      .mul_req_o(attention_mul_req),
+      .mul_lhs_o(attention_mul_lhs),
+      .mul_rhs_o(attention_mul_rhs),
+      .mul_product_i(shared_mul_product)
   );
 
   mfu_alu_default #(
@@ -222,6 +257,44 @@ module mfu_alu #(
       .result_meta_o(default_meta),
       .result_scalar_o(default_scalar)
   );
+
+  always_comb begin : proc_shared_mul_mux
+    for (mul_lane_idx = 0; mul_lane_idx < MUL_LANES; mul_lane_idx = mul_lane_idx + 1) begin
+      shared_mul_lhs[mul_lane_idx] = '0;
+      shared_mul_rhs[mul_lane_idx] = '0;
+      if (matmul_mul_req) begin
+        shared_mul_lhs[mul_lane_idx] = matmul_mul_lhs[mul_lane_idx];
+        shared_mul_rhs[mul_lane_idx] = matmul_mul_rhs[mul_lane_idx];
+      end else if (swiglu_mul_req) begin
+        shared_mul_lhs[mul_lane_idx] = swiglu_mul_lhs[mul_lane_idx];
+        shared_mul_rhs[mul_lane_idx] = swiglu_mul_rhs[mul_lane_idx];
+      end else if (geglu_mul_req) begin
+        shared_mul_lhs[mul_lane_idx] = geglu_mul_lhs[mul_lane_idx];
+        shared_mul_rhs[mul_lane_idx] = geglu_mul_rhs[mul_lane_idx];
+      end else if (attention_mul_req) begin
+        shared_mul_lhs[mul_lane_idx] = attention_mul_lhs[mul_lane_idx];
+        shared_mul_rhs[mul_lane_idx] = attention_mul_rhs[mul_lane_idx];
+      end
+    end
+  end
+
+  mfu_int8_mul8 shared_mul8_i (
+      .lhs_i(shared_mul_lhs),
+      .rhs_i(shared_mul_rhs),
+      .product_o(shared_mul_product)
+  );
+
+`ifndef SYNTHESIS
+  always_ff @(posedge clk_i) begin : proc_mul_req_onehot_check
+    if (!reset_i) begin
+      assert (({2'b00, matmul_mul_req} +
+               {2'b00, swiglu_mul_req} +
+               {2'b00, geglu_mul_req} +
+               {2'b00, attention_mul_req}) <= 3'd1)
+        else $error("mfu_alu shared multiplier requested by multiple leaves");
+    end
+  end
+`endif
 
   always_comb begin : proc_result_mux
     result_flit_comb = '0;

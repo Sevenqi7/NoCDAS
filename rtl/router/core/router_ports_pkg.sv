@@ -119,6 +119,22 @@ package router_ports_pkg;
   } flit_meta_t;
 
   typedef struct packed {
+    logic valid;
+    logic [FLIT_W-1:0] flit;
+    flit_meta_t meta;
+    route_path_t route_path;
+    logic [2:0] src_port;
+    logic [VC_ID_W-1:0] src_vc;
+    logic [2:0] route_sel;
+    logic [VC_ID_W-1:0] dst_vc;
+    router_traffic_class_e traffic_class;
+    logic head_like;
+    logic tail_like;
+    logic may_need_mfu;
+    logic reserved_vc;
+  } router_pipe_entry_t;
+
+  typedef struct packed {
     logic start;
     logic fetch_en;
     logic compute_en;
