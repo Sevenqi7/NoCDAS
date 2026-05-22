@@ -51,6 +51,8 @@ package router_ports_pkg;
   localparam int CNOC_TASK_ID_W = 16;
   localparam int CNOC_SRAM_DATA_W = 64;
   localparam int CNOC_SRAM_ADDR_W = 11;
+  localparam int MATMUL_CTX_SLOTS_MAX = 4;
+  localparam int MATMUL_CTX_SLOT_W = 2;
 
   // Semantic field widths carried by flit_meta_t.  The 256-bit flit payload is
   // treated as data; routing/compute control lives in the hardware fields below,
@@ -177,6 +179,28 @@ package router_ports_pkg;
     flit_meta_t meta;
     logic signed [31:0] scalar;
   } mfu_alu_result_t;
+
+  typedef struct packed {
+    logic valid;
+    logic [2:0] stream_port;
+    logic [VC_ID_W-1:0] stream_vc;
+  } attention_ctx_status_t;
+
+  typedef struct packed {
+    logic valid;
+    logic [2:0] stream_port;
+    logic [VC_ID_W-1:0] stream_vc;
+  } matmul_ctx_slot_t;
+
+  typedef struct packed {
+    logic any_valid;
+    logic has_free_slot;
+    logic match;
+    logic [MATMUL_CTX_SLOT_W-1:0] match_slot;
+    logic [MATMUL_CTX_SLOTS_MAX-1:0] slot_valid;
+    logic [MATMUL_CTX_SLOTS_MAX*3-1:0] slot_stream_port_flat;
+    logic [MATMUL_CTX_SLOTS_MAX*VC_ID_W-1:0] slot_stream_vc_flat;
+  } matmul_ctx_status_t;
 
   // Transitional alias for older code/comments.  New RTL should use
   // flit_meta_t so the type name reflects the NoC object it describes.

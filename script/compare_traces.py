@@ -16,6 +16,15 @@ import sys
 from pathlib import Path
 
 
+max_csv_field_size = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(max_csv_field_size)
+        break
+    except OverflowError:
+        max_csv_field_size //= 10
+
+
 DEFAULT_COMPARE_FIELDS = [
     "msg_type",
     "signal_id",
@@ -73,6 +82,9 @@ LEGACY_SHORT_ROW_FIELDS = [
     "cnoc_rs",
 ]
 
+QUANT_TRACE_MARKER = "# cnoc_quant_golden:"
+VALID_MSG_TYPES = {"0", "1", "2", "3", "4", "5"}
+
 
 def normalize_trace_row(path: Path, line: str, fields, values):
     """Normalize older short trace rows to the current header schema.
@@ -105,11 +117,15 @@ def normalize_trace_row(path: Path, line: str, fields, values):
 def parse_trace(path: Path):
     fields = None
     rows = []
+    has_quant_marker = False
 
     with path.open("r", encoding="utf-8") as trace_file:
         for raw_line in trace_file:
             line = raw_line.strip()
             if not line:
+                continue
+            if line.startswith(QUANT_TRACE_MARKER):
+                has_quant_marker = True
                 continue
             if line.startswith("# fields:"):
                 fields = [field.strip() for field in line.split(":", 1)[1].split(",")]
@@ -123,7 +139,26 @@ def parse_trace(path: Path):
 
     if fields is None:
         raise ValueError(f"{path}: trace header not found")
-    return fields, rows
+    return fields, rows, has_quant_marker
+
+
+def validate_compare_fields(path: Path, fields, compare_fields):
+    missing = [field for field in compare_fields if field not in fields]
+    if missing:
+        raise ValueError(
+            f"{path}: compare field(s) missing from trace header: {', '.join(missing)}"
+        )
+
+
+def validate_msg_types(path: Path, rows):
+    invalid_counts = collections.Counter(
+        row.get("msg_type", "") for row in rows
+        if row.get("msg_type", "") not in VALID_MSG_TYPES
+    )
+    if invalid_counts:
+        raise ValueError(
+            f"{path}: invalid msg_type values found: {dict(sorted(invalid_counts.items()))}"
+        )
 
 
 def should_ignore_attention_value(row, field, quant_cnoc, strict_attention):
@@ -210,8 +245,22 @@ def main() -> int:
     compare_fields = [field.strip() for field in args.fields.split(",") if field.strip()]
     if args.ignore_cnoc_values:
         compare_fields = [field for field in compare_fields if field not in CNOC_VALUE_FIELDS]
-    _, golden_rows = parse_trace(args.golden)
-    _, candidate_rows = parse_trace(args.candidate)
+    golden_fields, golden_rows, golden_has_quant_marker = parse_trace(args.golden)
+    candidate_fields, candidate_rows, candidate_has_quant_marker = parse_trace(args.candidate)
+    validate_compare_fields(args.golden, golden_fields, compare_fields)
+    validate_compare_fields(args.candidate, candidate_fields, compare_fields)
+    validate_msg_types(args.golden, golden_rows)
+    validate_msg_types(args.candidate, candidate_rows)
+    if args.quant_cnoc and (not golden_has_quant_marker or not candidate_has_quant_marker):
+        missing = []
+        if not golden_has_quant_marker:
+            missing.append(str(args.golden))
+        if not candidate_has_quant_marker:
+            missing.append(str(args.candidate))
+        raise ValueError(
+            "--quant-cnoc requires quantized trace marker in both traces; missing in: "
+            + ", ".join(missing)
+        )
 
     golden_type_counts = collections.Counter(row.get("msg_type", "") for row in golden_rows)
     candidate_type_counts = collections.Counter(row.get("msg_type", "") for row in candidate_rows)
@@ -323,6 +372,10 @@ def main() -> int:
         or extra
         or cnoc_missing
         or cnoc_extra
+        or path_missing
+        or path_extra
+        or value_missing
+        or value_extra
     ):
         return 1
     return 0

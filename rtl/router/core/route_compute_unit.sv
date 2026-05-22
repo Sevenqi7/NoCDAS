@@ -34,13 +34,13 @@ module route_compute_unit (
   logic [2:0] source_route_port;
   logic       source_route_active;
 
-  // The legacy input channel is intentionally kept for input_unit interface
-  // compatibility, but typed XY/source-route routing no longer consumes it.
+  // The input channel remains in the interface for compatibility, but typed
+  // XY/source-route routing no longer consumes it.
   // verilator lint_off UNUSED
   wire [2:0] unused_in_channel = in_channel_i;
   // verilator lint_on UNUSED
 
-  always_comb begin
+  always_comb begin : proc_source_route_state
     msg_type = meta_i.msg_type;
     source_route_port = route_port_i;
 
@@ -64,7 +64,7 @@ module route_compute_unit (
       .route_sel_o(xy_route_sel)
   );
 
-  always_comb begin
+  always_comb begin : proc_route_sel
     route_sel_o = ROUTER_PORT_LOCAL;
     // During reset, keep the output selection local/benign.
     if (!reset_i) begin

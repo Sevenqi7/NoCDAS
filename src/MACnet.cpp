@@ -8,6 +8,53 @@
 #include "parameters.hpp"
 #include "rtl/VerilatedRouter.hpp"
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
+
+namespace {
+
+int cnocDebugMinSignal() {
+    static bool parsed = false;
+    static int value = -1;
+    if (!parsed) {
+        parsed = true;
+        const char* env = std::getenv("CNOC_DEBUG_MIN_SIGNAL");
+        if (env != nullptr && *env != '\0') {
+            value = std::atoi(env);
+        }
+    }
+    return value;
+}
+
+int cnocDebugMaxSignal() {
+    static bool parsed = false;
+    static int value = -1;
+    if (!parsed) {
+        parsed = true;
+        const char* env = std::getenv("CNOC_DEBUG_MAX_SIGNAL");
+        if (env != nullptr && *env != '\0') {
+            value = std::atoi(env);
+        }
+    }
+    return value;
+}
+
+bool shouldDebugCnocSignal(int signal_id) {
+    const int min_signal = cnocDebugMinSignal();
+    const int max_signal = cnocDebugMaxSignal();
+    if (min_signal < 0 && max_signal < 0) {
+        return false;
+    }
+    if (min_signal >= 0 && signal_id < min_signal) {
+        return false;
+    }
+    if (max_signal >= 0 && signal_id > max_signal) {
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
 
 template<class C, typename T>
 bool contains(C&& c, T e) { return find(begin(c), end(c), e) != end(c); };
@@ -957,6 +1004,16 @@ void MACnet::runOneStep()
 
 #ifdef cNoC_MODE
             if (tmpPacket->message.type == 5 && tmpPacket->message.out_cycle <= cycles) {
+                if (shouldDebugCnocSignal(tmpPacket->message.signal_id)) {
+                    std::cerr << "[CNOC_MAC_DEBUG][consume_type5]"
+                              << " cycle=" << cycles
+                              << " layer=" << c_layer
+                              << " signal_id=" << tmpPacket->message.signal_id
+                              << " seq=" << tmpPacket->message.sequence_id
+                              << " out_cycle=" << tmpPacket->message.out_cycle
+                              << " cnoc_phase_before=" << cnoc_phase
+                              << std::endl;
+                }
                 int y = tmpPacket->message.sequence_id;
                 int p_offset = tmpPacket->message.psum_offset;
 
@@ -1017,7 +1074,26 @@ void MACnet::runOneStep()
 
                 cnoc_phase--;
 
+                if (shouldDebugCnocSignal(tmpPacket->message.signal_id)) {
+                    std::cerr << "[CNOC_MAC_DEBUG][phase_after_consume]"
+                              << " cycle=" << cycles
+                              << " layer=" << c_layer
+                              << " signal_id=" << tmpPacket->message.signal_id
+                              << " cnoc_phase_after=" << cnoc_phase
+                              << std::endl;
+                }
+
                 if (cnoc_phase == 3) {
+                    if (shouldDebugCnocSignal(tmpPacket->message.signal_id)) {
+                        std::cerr << "[CNOC_MAC_DEBUG][phase_reached_3]"
+                                  << " cycle=" << cycles
+                                  << " layer=" << c_layer
+                                  << " signal_id=" << tmpPacket->message.signal_id
+                                  << " tiling_active=" << this->tiling_active
+                                  << " last_mapped_task_idx=" << this->last_mapped_task_idx
+                                  << " total_tasks_in_layer=" << this->total_tasks_in_layer
+                                  << std::endl;
+                    }
                     if (this->tiling_active && this->last_mapped_task_idx < this->total_tasks_in_layer) {
 
                         this->vcNetwork->clearAllRouterSRAM();

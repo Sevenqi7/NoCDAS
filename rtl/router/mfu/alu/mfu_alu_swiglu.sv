@@ -1,5 +1,5 @@
 // Description: SwiGLU leaf for the MFU ALU.  NONLINEAR_IMPL_DPI keeps the
-//              legacy DPI-C path; the default path uses a local Q4.4 SiLU LUT.
+//              optional DPI-C path; the default path uses a local Q4.4 SiLU LUT.
 
 module mfu_alu_swiglu #(
     parameter int FLIT_W = router_ports_pkg::FLIT_W
@@ -20,6 +20,7 @@ module mfu_alu_swiglu #(
     output logic mul_req_o,
     output logic signed [7:0] mul_lhs_o [0:7],
     output logic signed [7:0] mul_rhs_o [0:7],
+    input  logic mul_rsp_valid_i,
     input  logic signed [15:0] mul_product_i [0:7]
 );
   import router_ports_pkg::*;
@@ -38,6 +39,7 @@ module mfu_alu_swiglu #(
     ST_IDLE,
     ST_ISSUE,
     ST_MUL,
+    ST_MUL_WAIT,
     ST_COMMIT,
     ST_DONE
   } state_e;
@@ -556,9 +558,18 @@ module mfu_alu_swiglu #(
           end
         end
         ST_MUL: begin
+`ifdef NONLINEAR_IMPL_DPI
           state_q <= ST_COMMIT;
-          for (seq_lane_idx = 0; seq_lane_idx < MUL_LANES; seq_lane_idx = seq_lane_idx + 1) begin
-            mul_product_q[seq_lane_idx] <= mul_product_i[seq_lane_idx];
+`else
+          state_q <= ST_MUL_WAIT;
+`endif
+        end
+        ST_MUL_WAIT: begin
+          if (mul_rsp_valid_i) begin
+            state_q <= ST_COMMIT;
+            for (seq_lane_idx = 0; seq_lane_idx < MUL_LANES; seq_lane_idx = seq_lane_idx + 1) begin
+              mul_product_q[seq_lane_idx] <= mul_product_i[seq_lane_idx];
+            end
           end
         end
         ST_COMMIT: begin

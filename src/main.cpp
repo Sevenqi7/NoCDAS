@@ -21,6 +21,9 @@
 #include "MACnet.hpp"
 #include "Model.hpp"
 #include "TraceLogger.hpp"
+#ifdef ROUTER_ENABLE_COSIM
+#include "verilated.h"
+#endif
 
 using namespace std;
 
@@ -62,6 +65,8 @@ void parseCmdLine(int arg_num, char *arg_vet[])
 				GlobalParams::enable_trace = true;
 			else if (!strcmp(arg_vet[i], "-rtl_router"))
 				GlobalParams::enable_rtl_router = true;
+			else if (arg_vet[i][0] == '+')
+				continue;
 			else {
 				cerr << "Error: Invalid option: " << arg_vet[i] << endl;
 				exit(1);
@@ -74,6 +79,9 @@ void parseCmdLine(int arg_num, char *arg_vet[])
 int main(int arg_num, char *arg_vet[]) {
 
 	cout << "Initialize" << endl;
+#ifdef ROUTER_ENABLE_COSIM
+	Verilated::commandArgs(arg_num, arg_vet);
+#endif
 	parseCmdLine(arg_num, arg_vet);
 
 	if (GlobalParams::enable_trace) {

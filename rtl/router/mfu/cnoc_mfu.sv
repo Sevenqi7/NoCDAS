@@ -8,7 +8,8 @@ module cnoc_mfu #(
     parameter int VC_NUM = 8,
     parameter int VC_ID_W = 3,
     parameter int FLIT_W = 256,
-    parameter int MFU_MATMUL_ACC_W = 32
+    parameter int MFU_MATMUL_ACC_W = 32,
+    parameter int MATMUL_CTX_SLOTS = 1
 ) (
     input  logic clk,
     input  logic reset,
@@ -37,7 +38,9 @@ module cnoc_mfu #(
     output logic [FLIT_W-1:0] emit_flit_o,
     output router_ports_pkg::flit_meta_t emit_meta_o,
     output router_ports_pkg::route_path_t emit_route_path_o,
-    output logic [VC_ID_W-1:0] emit_vc_id_o
+    output logic [VC_ID_W-1:0] emit_vc_id_o,
+    output router_ports_pkg::attention_ctx_status_t attention_ctx_o,
+    output router_ports_pkg::matmul_ctx_status_t matmul_ctx_o
 
 `ifdef ROUTER_ENABLE_COSIM
     ,
@@ -138,6 +141,16 @@ module cnoc_mfu #(
   mfu_alu_data_req_t alu_data_req;
   mfu_alu_op_t alu_op;
   mfu_alu_result_t alu_result;
+  attention_ctx_status_t attention_ctx_status;
+  matmul_ctx_status_t matmul_ctx_status;
+  logic raw_attention_head_like;
+  logic raw_attention_owner_match;
+  logic raw_attention_capture_ok;
+  logic raw_data_entry;
+  logic raw_data_head_like;
+  logic raw_data_owner_match;
+  logic raw_data_ctx_has_free_slot;
+  logic raw_data_capture_ok;
 
 `ifdef ROUTER_ENABLE_COSIM
   // Status bridge for NoCDAS phase gating and trace diagnostics.  These are not
@@ -152,7 +165,42 @@ module cnoc_mfu #(
 
   // Capture/control path.  Non-cNoC traffic is intentionally invisible here and
   // remains on Router.sv's regular datapath.
-  assign capture_o = raw_valid_i && !pkt_valid_q && !fsm_busy;
+  assign raw_attention_head_like =
+      flit_is_head_like(raw_meta_i.flit_kind);
+  assign raw_attention_owner_match =
+      attention_ctx_status.valid &&
+      (attention_ctx_status.stream_port == raw_stream_port_i) &&
+      (attention_ctx_status.stream_vc == raw_stream_vc_i);
+  assign raw_attention_capture_ok =
+      !(raw_meta_i.msg_type == ROUTER_MSG_COMP && raw_meta_i.process &&
+        (raw_meta_i.opcode == OPCODE_ATTENTION)) ||
+      (raw_attention_head_like && (!attention_ctx_status.valid || raw_attention_owner_match)) ||
+      (!raw_attention_head_like && raw_attention_owner_match);
+  assign raw_data_entry =
+      raw_meta_i.msg_type == ROUTER_MSG_COMP && raw_meta_i.process &&
+      ((raw_meta_i.opcode == OPCODE_LINEAR) || (raw_meta_i.opcode == OPCODE_MATMUL));
+  assign raw_data_head_like =
+      flit_is_head_like(raw_meta_i.flit_kind);
+  always_comb begin : proc_raw_data_owner_match
+    raw_data_owner_match = 1'b0;
+    for (int slot_idx = 0; slot_idx < MATMUL_CTX_SLOTS_MAX; slot_idx = slot_idx + 1) begin
+      if (!raw_data_owner_match &&
+          matmul_ctx_status.slot_valid[slot_idx] &&
+          (matmul_ctx_status.slot_stream_port_flat[slot_idx * 3 +: 3] == raw_stream_port_i) &&
+          (matmul_ctx_status.slot_stream_vc_flat[slot_idx * VC_ID_W +: VC_ID_W] ==
+           raw_stream_vc_i)) begin
+        raw_data_owner_match = 1'b1;
+      end
+    end
+  end
+  assign raw_data_ctx_has_free_slot = matmul_ctx_status.has_free_slot;
+  assign raw_data_capture_ok =
+      !raw_data_entry ||
+      (raw_data_head_like && (raw_data_owner_match || raw_data_ctx_has_free_slot)) ||
+      (!raw_data_head_like && raw_data_owner_match);
+
+  assign capture_o = raw_valid_i && !pkt_valid_q && !fsm_busy &&
+                     raw_attention_capture_ok && raw_data_capture_ok;
   assign capture_out_sel_o = raw_out_sel_i;
   assign busy_o = pkt_valid_q || fsm_busy || alu_result.busy;
   assign compute_done = decoded_is_type4_q ? 1'b1 : alu_result.valid;
@@ -164,6 +212,8 @@ module cnoc_mfu #(
   assign emit_flit_o = writeback_flit;
   assign emit_route_path_o = pkt_route_path_q;
   assign emit_vc_id_o = pkt_vc_q;
+  assign attention_ctx_o = attention_ctx_status;
+  assign matmul_ctx_o = matmul_ctx_status;
 
   always_comb begin : proc_type4_storage
     type4_bank_sel = (decoded_opcode_q == OPCODE_ATTENTION);
@@ -474,7 +524,8 @@ module cnoc_mfu #(
       .SRAM_ADDR_W(SRAM_ADDR_W),
       .DATA_W(ALU_DATA_W),
       .DATA_ELEM_W(ALU_DATA_ELEM_W),
-      .DATA_ACC_W(MFU_MATMUL_ACC_W)
+      .DATA_ACC_W(MFU_MATMUL_ACC_W),
+      .MATMUL_CTX_SLOTS(MATMUL_CTX_SLOTS)
   ) mfu_datapath_alu_i (
       .clk_i(clk),
       .reset_i(reset),
@@ -485,7 +536,9 @@ module cnoc_mfu #(
       .ctx_i(alu_ctx),
       .data_rsp_i(alu_data_rsp),
       .data_req_o(alu_data_req),
-      .result_o(alu_result)
+      .result_o(alu_result),
+      .attention_ctx_o(attention_ctx_status),
+      .matmul_ctx_o(matmul_ctx_status)
   );
 
   assign sram_rd_bank_sel =
@@ -501,6 +554,17 @@ module cnoc_mfu #(
       // the in-flight cNoC flit and lose its storage/compute side effect.
       if (capture_o && pkt_valid_q) begin
         $error("cnoc_mfu: captured a second flit while pipeline entry is occupied");
+      end
+
+      if (raw_valid_i && !capture_o && !pkt_valid_q && !fsm_busy &&
+          (raw_meta_i.msg_type == ROUTER_MSG_COMP) && raw_meta_i.process &&
+          (raw_meta_i.opcode == OPCODE_ATTENTION) && !raw_attention_capture_ok) begin
+        $error("cnoc_mfu: attention capture gating rejected owner-mismatched stream");
+      end
+
+      if (raw_valid_i && !capture_o && !pkt_valid_q && !fsm_busy &&
+          raw_data_entry && !raw_data_capture_ok) begin
+        $error("cnoc_mfu: data-op capture gating rejected owner-mismatched stream");
       end
 
       // Upstream arbitration owns the MFU-bound decision.  A non-cNoC flit

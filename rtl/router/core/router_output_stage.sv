@@ -12,9 +12,11 @@ module router_output_stage #(
     input  logic [2:0] y_cur_i,
     input  router_ports_pkg::router_pipe_entry_t out_entry_i [NUM_PORTS],
     input  router_ports_pkg::routport_flow_t routport_flow_i [NUM_PORTS],
+    input  router_ports_pkg::attention_ctx_status_t attention_ctx_status_i,
+    input  router_ports_pkg::matmul_ctx_status_t matmul_ctx_status_i,
 
     input  logic [NUM_PORTS-1:0] mfu_holds_routport_i,
-    input  logic mfu_busy_i,
+    input  logic mfu_ingress_ready_i,
     input  logic mfu_emit_valid_i,
     input  logic [2:0] mfu_emit_out_sel_i,
     input  logic [FLIT_W-1:0] mfu_emit_flit_i,
@@ -24,7 +26,8 @@ module router_output_stage #(
 
     output logic [NUM_PORTS-1:0] output_commit_fire_o,
     output logic [NUM_PORTS-1:0] output_mfu_selected_o,
-    output router_ports_pkg::router_pipe_entry_t output_commit_entry_o [NUM_PORTS],
+    output logic [NUM_PORTS-1:0] output_release_valid_o,
+    output logic [VC_ID_W-1:0] output_release_vc_o [NUM_PORTS],
     output router_ports_pkg::router_pipe_entry_t out_entry_o [NUM_PORTS],
     output router_ports_pkg::rinport_ctrl_t rinport_ctrl_o [NUM_PORTS],
 
@@ -39,9 +42,13 @@ module router_output_stage #(
 );
   import router_ports_pkg::*;
 
+  localparam logic [4:0] OP_ATTENTION = 5'd23;
+  localparam logic [4:0] OP_LINEAR = 5'd0;
+  localparam logic [4:0] OP_MATMUL = 5'd15;
   logic [NUM_PORTS-1:0] output_regular_commit;
   logic [NUM_PORTS-1:0] output_ready_for_entry;
   logic [NUM_PORTS-1:0] output_entry_needs_mfu;
+  logic [NUM_PORTS-1:0] output_ctx_ok;
   logic [NUM_PORTS-1:0] source_commit_used;
   flit_meta_t output_meta_next [NUM_PORTS];
   route_path_t output_route_path_next [NUM_PORTS];
@@ -50,9 +57,11 @@ module router_output_stage #(
     source_commit_used = '0;
     output_commit_fire_o = '0;
     output_mfu_selected_o = '0;
+    output_release_valid_o = '0;
     output_regular_commit = '0;
     output_ready_for_entry = '0;
     output_entry_needs_mfu = '0;
+    output_ctx_ok = '1;
     raw_write_o = '0;
 
     for (int unsigned out_idx = 0; out_idx < NUM_PORTS; out_idx = out_idx + 1) begin
@@ -61,9 +70,9 @@ module router_output_stage #(
       raw_meta_o[out_idx] = '0;
       raw_route_path_o[out_idx] = '0;
       raw_vc_id_o[out_idx] = '0;
+      output_release_vc_o[out_idx] = '0;
       raw_stream_port_o[out_idx] = ROUTER_PORT_INV;
       raw_stream_vc_o[out_idx] = '0;
-      output_commit_entry_o[out_idx] = out_entry_i[out_idx];
       out_entry_o[out_idx] = out_entry_i[out_idx];
       output_meta_next[out_idx] = out_entry_i[out_idx].meta;
       output_route_path_next[out_idx] = out_entry_i[out_idx].route_path;
@@ -85,6 +94,16 @@ module router_output_stage #(
     end
 
     for (int unsigned out_idx = 0; out_idx < NUM_PORTS; out_idx = out_idx + 1) begin
+      logic output_data_owner_match;
+      logic output_attention_owner_match;
+      logic output_attention_ctx_ok;
+      logic output_data_ctx_ok;
+
+      output_data_owner_match = 1'b0;
+      output_attention_owner_match = 1'b0;
+      output_attention_ctx_ok = 1'b1;
+      output_data_ctx_ok = 1'b1;
+
       if (out_entry_i[out_idx].valid &&
           routport_flow_i[out_idx].state_ready &&
           routport_flow_i[out_idx].downstream_vc_credit_mask[out_entry_i[out_idx].dst_vc] &&
@@ -101,6 +120,48 @@ module router_output_stage #(
              (out_entry_i[out_idx].meta.process ||
               ((out_entry_i[out_idx].meta.dst_x == x_cur_i) &&
                (out_entry_i[out_idx].meta.dst_y == y_cur_i))));
+
+        output_ctx_ok[out_idx] = 1'b1;
+        for (int slot_idx = 0; slot_idx < MATMUL_CTX_SLOTS_MAX; slot_idx = slot_idx + 1) begin
+          if (!output_data_owner_match &&
+              matmul_ctx_status_i.slot_valid[slot_idx] &&
+              (matmul_ctx_status_i.slot_stream_port_flat[slot_idx * 3 +: 3] ==
+               out_entry_i[out_idx].src_port) &&
+            (matmul_ctx_status_i.slot_stream_vc_flat[slot_idx * VC_ID_W +: VC_ID_W] ==
+               out_entry_i[out_idx].src_vc)) begin
+            output_data_owner_match = 1'b1;
+          end
+        end
+
+        output_attention_owner_match =
+            attention_ctx_status_i.valid &&
+            (attention_ctx_status_i.stream_port == out_entry_i[out_idx].src_port) &&
+            (attention_ctx_status_i.stream_vc == out_entry_i[out_idx].src_vc);
+
+        if ((out_entry_i[out_idx].meta.msg_type == ROUTER_MSG_COMP) &&
+            out_entry_i[out_idx].meta.process &&
+            (out_entry_i[out_idx].meta.opcode == OP_ATTENTION)) begin
+          if (out_entry_i[out_idx].head_like) begin
+            output_attention_ctx_ok =
+                !attention_ctx_status_i.valid || output_attention_owner_match;
+          end else begin
+            output_attention_ctx_ok =
+                attention_ctx_status_i.valid && output_attention_owner_match;
+          end
+          output_ctx_ok[out_idx] = output_ctx_ok[out_idx] && output_attention_ctx_ok;
+        end
+        if ((out_entry_i[out_idx].meta.msg_type == ROUTER_MSG_COMP) &&
+            out_entry_i[out_idx].meta.process &&
+            ((out_entry_i[out_idx].meta.opcode == OP_LINEAR) ||
+             (out_entry_i[out_idx].meta.opcode == OP_MATMUL))) begin
+          if (out_entry_i[out_idx].head_like) begin
+            output_data_ctx_ok =
+                output_data_owner_match || matmul_ctx_status_i.has_free_slot;
+          end else begin
+            output_data_ctx_ok = output_data_owner_match;
+          end
+          output_ctx_ok[out_idx] = output_ctx_ok[out_idx] && output_data_ctx_ok;
+        end
       end
 `else
       output_entry_needs_mfu[out_idx] = 1'b0;
@@ -111,7 +172,8 @@ module router_output_stage #(
       if (output_ready_for_entry[out_idx] &&
           !source_commit_used[out_entry_i[out_idx].src_port]) begin
 `ifdef ENABLE_CNOC_MFU
-        if (output_entry_needs_mfu[out_idx] && !mfu_busy_i && (output_mfu_selected_o == '0)) begin
+        if (output_entry_needs_mfu[out_idx] && mfu_ingress_ready_i && output_ctx_ok[out_idx] &&
+            (output_mfu_selected_o == '0)) begin
           output_mfu_selected_o[out_idx] = 1'b1;
           output_commit_fire_o[out_idx] = 1'b1;
           source_commit_used[out_entry_i[out_idx].src_port] = 1'b1;
@@ -148,6 +210,10 @@ module router_output_stage #(
         rinport_ctrl_o[out_entry_i[out_idx].src_port].commit_vc = out_entry_i[out_idx].src_vc;
         rinport_ctrl_o[out_entry_i[out_idx].src_port].commit_tail_like =
             out_entry_i[out_idx].tail_like;
+        if (out_entry_i[out_idx].reserved_vc && !output_mfu_selected_o[out_idx]) begin
+          output_release_valid_o[out_idx] = 1'b1;
+          output_release_vc_o[out_idx] = out_entry_i[out_idx].dst_vc;
+        end
       end
 
       if (output_regular_commit[out_idx]) begin
@@ -176,6 +242,19 @@ module router_output_stage #(
       if (output_commit_fire_o[out_idx] && !out_entry_i[out_idx].valid) begin
         $error("router_output_stage: committed an empty output pipeline slot");
       end
+
+`ifdef ENABLE_CNOC_MFU
+      if (output_commit_fire_o[out_idx] &&
+          output_mfu_selected_o[out_idx] &&
+          (out_entry_i[out_idx].meta.msg_type == ROUTER_MSG_COMP) &&
+          out_entry_i[out_idx].meta.process &&
+          ((out_entry_i[out_idx].meta.opcode == OP_ATTENTION) ||
+           (out_entry_i[out_idx].meta.opcode == OP_LINEAR) ||
+           (out_entry_i[out_idx].meta.opcode == OP_MATMUL)) &&
+          !output_ctx_ok[out_idx]) begin
+        $error("router_output_stage: committed an owner-gated MFU entry without eligibility");
+      end
+`endif
     end
   end
 `endif

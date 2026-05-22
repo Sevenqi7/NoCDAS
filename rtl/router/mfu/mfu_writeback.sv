@@ -76,7 +76,8 @@ module mfu_writeback #(
           emit_meta_o.cosim.data_q = emit_flit_o[data_lane_byte_offset +: 8];
 `endif
         end
-        // Fallback single-lane writeback for simple scalar/experimental opcodes.
+        // Unsupported scalar opcodes are ignored by the ALU wrapper and pass
+        // through unchanged; simulation emits a debug notice at issue time.
         default: begin
           emit_flit_o = alu_flit_i;
           emit_meta_o = alu_meta_i;

@@ -27,8 +27,10 @@
 #include <bitset>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <iostream>
 #include <unordered_map>
 #include <vector>
 
@@ -99,11 +101,42 @@ std::array<uint32_t, N> readWideWord(const WData* src) {
   return word;
 }
 
+int cnocRtlDebugSignal() {
+  static bool parsed = false;
+  static int signal = -1;
+  if (!parsed) {
+    parsed = true;
+    const char* env = std::getenv("CNOC_RTL_DEBUG_SIGNAL");
+    if (env != nullptr && *env != '\0') {
+      signal = std::atoi(env);
+    }
+  }
+  return signal;
+}
+
+bool shouldDebugRtlComp(const Flit* flit) {
+  const int signal = cnocRtlDebugSignal();
+  return signal >= 0 &&
+         flit != nullptr &&
+         flit->packet != nullptr &&
+         flit->packet->message.type == CNOC_TYPE_COMP &&
+         flit->packet->message.signal_id == signal;
+}
+
 }  // namespace
 
 class VerilatedRouter::Impl {
 public:
   explicit Impl(VCRouter* owner) : owner_(owner), model_(&ctx_) {
+    const char* argv_no_debug[] = {"NoCDASim"};
+    const char* argv_iu_debug[] = {"NoCDASim", "+CNOC_RTL_IU_DEBUG"};
+    const char* iu_debug_env = std::getenv("CNOC_RTL_IU_DEBUG");
+    const bool iu_debug_enabled = iu_debug_env != nullptr && *iu_debug_env != '\0';
+    if (iu_debug_enabled) {
+      ctx_.commandArgs(2, argv_iu_debug);
+    } else {
+      ctx_.commandArgs(1, argv_no_debug);
+    }
     rr_vc_.fill(0);
     input_flow_ = {&model_.east_input_flow,
                    &model_.west_input_flow,
@@ -389,9 +422,26 @@ private:
         cand.flit,
         cand.cpp_port,
         cand.src_vc};
+
+    if (shouldDebugRtlComp(cand.flit)) {
+      std::cerr << "[CNOC_RTL_DEBUG][accept]"
+                << " cycle=" << cycles
+                << " router=" << (owner_->id[0] * X_NUM + owner_->id[1])
+                << " signal_id=" << cand.flit->packet->message.signal_id
+                << " flit_id=" << cand.flit->id
+                << " flit_type=" << cand.flit->type
+                << " src_cpp_port=" << cand.cpp_port
+                << " src_vc=" << cand.src_vc
+                << " token=" << cand.token
+                << " data_offset=" << cand.flit->global_data_offset
+                << " payload_size=" << cand.flit->get_payload_size()
+                << std::endl;
+    }
   }
 
-  // Required: chooses one ready NoCDAS flit per RTL input port without doing route/VC decisions.
+  // Choose one ready NoCDAS flit for one RTL input. Head flits require a free
+  // source VC state; body/tail flits may enter once their packet owns the VC,
+  // so they can wait inside the RTL input buffer before the head leaves this hop.
   bool selectCandidate(int rtl_port, int cpp_port, uint32_t push_ack_mask, InjectCandidate* out) {
     out->valid = false;
 
@@ -407,9 +457,6 @@ private:
       if (vc_idx >= RTL_VC_NUM) {
         continue;
       }
-      if (((push_ack_mask >> vc_idx) & 0x1u) == 0u) {
-        continue;
-      }
 
       FlitBuffer* buf = in_port->buffer_list[vc_idx];
       if (buf == nullptr || buf->cur_flit_num == 0) {
@@ -420,21 +467,78 @@ private:
       if (cand == nullptr || cand->packet == nullptr) {
         continue;
       }
+      const bool debug_comp = shouldDebugRtlComp(cand);
+      if (((push_ack_mask >> vc_idx) & 0x1u) == 0u) {
+        if (debug_comp) {
+          std::cerr << "[CNOC_RTL_DEBUG][hold_push_ack]"
+                    << " cycle=" << cycles
+                    << " router=" << (owner_->id[0] * X_NUM + owner_->id[1])
+                    << " signal_id=" << cand->packet->message.signal_id
+                    << " flit_id=" << cand->id
+                    << " flit_type=" << cand->type
+                    << " cpp_port=" << cpp_port
+                    << " vc=" << vc_idx
+                    << " state=" << ((vc_idx < static_cast<int>(in_port->state.size())) ?
+                                     in_port->state[vc_idx] : -1)
+                    << std::endl;
+        }
+        continue;
+      }
       if (cand->sched_time >= cycles) {
+        if (debug_comp) {
+          std::cerr << "[CNOC_RTL_DEBUG][hold_sched]"
+                    << " cycle=" << cycles
+                    << " router=" << (owner_->id[0] * X_NUM + owner_->id[1])
+                    << " signal_id=" << cand->packet->message.signal_id
+                    << " flit_id=" << cand->id
+                    << " flit_type=" << cand->type
+                    << " cpp_port=" << cpp_port
+                    << " vc=" << vc_idx
+                    << " sched_time=" << cand->sched_time
+                    << std::endl;
+        }
         continue;
       }
       const bool head_like = (cand->type == 0 || cand->type == 10);
       const int required_state = head_like ? 2 : 3;
       if (vc_idx >= static_cast<int>(in_port->state.size()) ||
           in_port->state[vc_idx] != required_state) {
+        if (debug_comp) {
+          std::cerr << "[CNOC_RTL_DEBUG][hold_state]"
+                    << " cycle=" << cycles
+                    << " router=" << (owner_->id[0] * X_NUM + owner_->id[1])
+                    << " signal_id=" << cand->packet->message.signal_id
+                    << " flit_id=" << cand->id
+                    << " flit_type=" << cand->type
+                    << " cpp_port=" << cpp_port
+                    << " vc=" << vc_idx
+                    << " required_state=" << required_state
+                    << " actual_state="
+                    << ((vc_idx < static_cast<int>(in_port->state.size())) ?
+                        in_port->state[vc_idx] : -1)
+                    << std::endl;
+        }
         continue;
       }
-      if (!head_like &&
-          (vc_idx >= static_cast<int>(in_port->out_vc.size()) || in_port->out_vc[vc_idx] < 0)) {
-        continue;
-      }
-
       rr_vc_[rtl_port] = (vc_idx + 1) % vc_count;
+      if (debug_comp) {
+        const bool out_vc_ready =
+            vc_idx < static_cast<int>(in_port->out_vc.size()) &&
+            in_port->out_vc[vc_idx] >= 0;
+        std::cerr << "[CNOC_RTL_DEBUG][select]"
+                  << " cycle=" << cycles
+                  << " router=" << (owner_->id[0] * X_NUM + owner_->id[1])
+                  << " signal_id=" << cand->packet->message.signal_id
+                  << " flit_id=" << cand->id
+                  << " flit_type=" << cand->type
+                  << " rtl_port=" << rtl_port
+                  << " cpp_port=" << cpp_port
+                  << " vc=" << vc_idx
+                  << " head_like=" << head_like
+                  << " out_vc_ready="
+                  << (out_vc_ready ? 1 : 0)
+                  << std::endl;
+      }
       out->valid = true;
       out->cpp_port = cpp_port;
       out->src_vc = vc_idx;
@@ -592,6 +696,18 @@ private:
         static_cast<int>(vc_id),
         rec.src_cpp_port,
         rec.src_vc});
+    if (shouldDebugRtlComp(rec.flit)) {
+      std::cerr << "[CNOC_RTL_DEBUG][rtl_emit]"
+                << " cycle=" << cycles
+                << " router=" << (owner_->id[0] * X_NUM + owner_->id[1])
+                << " signal_id=" << rec.flit->packet->message.signal_id
+                << " flit_id=" << rec.flit->id
+                << " flit_type=" << rec.flit->type
+                << " rtl_out_port=" << rtl_out_port
+                << " cpp_out_port=" << cpp_out_port
+                << " target_vc=" << static_cast<int>(vc_id)
+                << std::endl;
+    }
     if (rec.src_cpp_port >= 0 && rec.src_cpp_port < owner_->port_num) {
       RInPort* src_in = owner_->in_port_list[rec.src_cpp_port];
       if (src_in != nullptr &&
@@ -642,7 +758,8 @@ private:
     }
   }
 
-  // Moves a pending output flit into the next hop if the target C++ RInPort state allows it.
+  // Move a pending output flit into the next hop if the target C++ RInPort has
+  // room. Head flits claim a target VC; body/tail reuse the existing claim.
   bool enqueueToNextHop(const PendingOutput& pending) {
     if (pending.cpp_out_port >= owner_->port_num ||
         owner_->out_port_list[pending.cpp_out_port]->out_link == nullptr) {
@@ -693,6 +810,18 @@ private:
     owner_->port_total_utilization++;
     if (pending.cpp_out_port <= 3) {
       owner_->port_utilization_innet++;
+    }
+    if (shouldDebugRtlComp(flit)) {
+      std::cerr << "[CNOC_RTL_DEBUG][next_hop]"
+                << " cycle=" << cycles
+                << " router=" << (owner_->id[0] * X_NUM + owner_->id[1])
+                << " signal_id=" << flit->packet->message.signal_id
+                << " flit_id=" << flit->id
+                << " flit_type=" << flit->type
+                << " cpp_out_port=" << pending.cpp_out_port
+                << " target_vc=" << pending.target_vc
+                << " next_router=" << (next->rid[0] * X_NUM + next->rid[1])
+                << std::endl;
     }
     return true;
   }
@@ -748,7 +877,20 @@ private:
     int row = owner_->id[0];
     int col = owner_->id[1];
     const int msg_type = flit->packet->message.type;
+    std::bitset<TOT_NUM> process_targets;
     std::bitset<TOT_NUM> processed_router;
+    if (msg_type == CNOC_TYPE_COMP) {
+      // The final source-route entry is the return destination.  Only the
+      // preceding cNoC compute-path routers should assert meta.process.
+      const int process_entries =
+          path.empty() ? 0 : static_cast<int>(path.size()) - 1;
+      for (int idx = 0; idx < process_entries; ++idx) {
+        const int router_id = path[idx];
+        if (router_id >= 0 && router_id < TOT_NUM) {
+          process_targets.set(static_cast<size_t>(router_id));
+        }
+      }
+    }
     auto append_hop = [&](uint8_t rtl_port) -> bool {
       if (flit->rtl_route_ports.size() >= RTL_ROUTE_MAX_HOPS) {
         return false;
@@ -758,6 +900,7 @@ private:
           msg_type == CNOC_TYPE_COMP &&
           current_router >= 0 &&
           current_router < TOT_NUM &&
+          process_targets.test(static_cast<size_t>(current_router)) &&
           !processed_router.test(static_cast<size_t>(current_router));
       if (process_here) {
         processed_router.set(static_cast<size_t>(current_router));

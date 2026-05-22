@@ -6,6 +6,33 @@
 #include "NI.hpp"
 #include "../parameters.hpp"
 #include "../TraceLogger.hpp"
+#include <cstdlib>
+#include <iostream>
+
+namespace {
+
+int cnocRtlDebugSignal() {
+    static bool parsed = false;
+    static int signal = -1;
+    if (!parsed) {
+        parsed = true;
+        const char* env = std::getenv("CNOC_RTL_DEBUG_SIGNAL");
+        if (env != nullptr && *env != '\0') {
+            signal = std::atoi(env);
+        }
+    }
+    return signal;
+}
+
+bool shouldDebugPacket(const Packet* packet) {
+    const int signal = cnocRtlDebugSignal();
+    return signal >= 0 &&
+           packet != nullptr &&
+           packet->message.type == 5 &&
+           packet->message.signal_id == signal;
+}
+
+}  // namespace
 
 int NI::count_s=0;
 int NI::count_r=0;
@@ -684,12 +711,33 @@ void NI::inputCheck(){
           if(flit->sched_time < cycles && (flit->type == 1 || flit->type == 10)){  ///< tail or head tail flit
               Packet* packet = flit->packet; // Spostato all'inizio del blocco
 
+              if (shouldDebugPacket(packet)) {
+                  std::cerr << "[CNOC_RTL_DEBUG][ni_tail_seen]"
+                            << " cycle=" << cycles
+                            << " ni=" << id
+                            << " vc=" << i
+                            << " flit_id=" << flit->id
+                            << " flit_type=" << flit->type
+                            << " packet_type=" << packet->type
+                            << " out_cycle_before=" << packet->message.out_cycle
+                            << " trace_nodes=" << packet->trace_nodes.size()
+                            << std::endl;
+              }
+
               // --- RTL FIFO BACKPRESSURE LOGIC ---
               // Determiniamo la FIFO di destinazione (0 per Request, 1 per Response/cNoC)
               int target_fifo = (packet->type == 0) ? 0 : 1; 
               
               // Se la FIFO di destinazione è piena, applichiamo la contropressione
               if (packet_buffer_out[target_fifo].size() >= NI_RX_FIFO_DEPTH) {
+                  if (shouldDebugPacket(packet)) {
+                      std::cerr << "[CNOC_RTL_DEBUG][ni_fifo_full]"
+                                << " cycle=" << cycles
+                                << " ni=" << id
+                                << " target_fifo=" << target_fifo
+                                << " fifo_size=" << packet_buffer_out[target_fifo].size()
+                                << std::endl;
+                  }
                   // Ignoriamo questo flit per il ciclo corrente. 
                   // Non arrivando al while() in fondo, i flit non vengono estratti.
                   // I crediti non vengono restituiti, fermando il router a monte.
@@ -735,9 +783,29 @@ void NI::inputCheck(){
                   packet_buffer_out[1].push_back(packet);
               }
 
+              if (shouldDebugPacket(packet)) {
+                  std::cerr << "[CNOC_RTL_DEBUG][ni_packet_ready]"
+                            << " cycle=" << cycles
+                            << " ni=" << id
+                            << " target_fifo=" << target_fifo
+                            << " out_cycle_after=" << packet->message.out_cycle
+                            << " trace_nodes=" << flit->trace_node.size()
+                            << " signal_id=" << packet->message.signal_id
+                            << std::endl;
+              }
+
               packet->trace_nodes = flit->trace_node;
               packet->trace_times = flit->trace_time;
               TraceLogger::instance().logPacket(*packet);
+
+              if (shouldDebugPacket(packet)) {
+                  std::cerr << "[CNOC_RTL_DEBUG][ni_trace_logged]"
+                            << " cycle=" << cycles
+                            << " ni=" << id
+                            << " signal_id=" << packet->message.signal_id
+                            << " path_nodes=" << packet->trace_nodes.size()
+                            << std::endl;
+              }
 
 
               if(packet->message.QoS == 3 || packet->message.QoS == 1){

@@ -10,6 +10,15 @@ endif()
 
 option(CNOC_QUANT_GOLDEN "Enable compile-time INT8 cNoC quantized golden trace mode" OFF)
 option(ENABLE_CNOC_MFU "Enable RTL cNoC/MFU side pipeline in the Verilated router" OFF)
+set(MATMUL_CTX_SLOTS 1 CACHE STRING "MatMul/Linear context slots to compile into Router")
+
+if(NOT MATMUL_CTX_SLOTS MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "MATMUL_CTX_SLOTS must be a positive integer")
+endif()
+
+if(MATMUL_CTX_SLOTS LESS 1 OR MATMUL_CTX_SLOTS GREATER 4)
+    message(FATAL_ERROR "MATMUL_CTX_SLOTS must be in the range [1, 4]")
+endif()
 
 if(CNOC_QUANT_GOLDEN)
     set(ENABLE_CNOC_MFU ON CACHE BOOL "Enable RTL cNoC/MFU side pipeline in the Verilated router" FORCE)
@@ -37,7 +46,8 @@ if(VERILATOR_ROOT AND EXISTS "${VERILATOR_ROOT}/include/verilated.cpp")
     set(VERILATED_ROUTER_MODEL_LIB "${VERILATED_ROUTER_DIR}/libVNoCRouter.a")
     set(VERILATED_ROUTER_RUNTIME_LIB "${VERILATED_ROUTER_DIR}/libverilated.a")
     set(VERILATED_ROUTER_ALL_LIB "${VERILATED_ROUTER_DIR}/VNoCRouter__ALL.a")
-    set(VERILATED_ROUTER_DEFINES "-DROUTER_ENABLE_COSIM" "-DNONLINEAR_IMPL_DPI")
+    set(VERILATED_ROUTER_DEFINES "-DROUTER_ENABLE_COSIM" "-DNONLINEAR_IMPL_DPI"
+        "-GMATMUL_CTX_SLOTS=${MATMUL_CTX_SLOTS}")
     if(ENABLE_CNOC_MFU)
         list(APPEND VERILATED_ROUTER_DEFINES "-DENABLE_CNOC_MFU")
     endif()

@@ -8,20 +8,22 @@ QUANT_CNOC=0
 STRICT_ATTENTION=0
 MODEL="toy"
 COMPARE_MODE=""
+MATMUL_CTX_SLOTS=1
 
 usage() {
   cat <<USAGE
-Usage: $0 [--quant-cnoc] [--strict-attention] [--model toy|synthetic-cnoc|medium-synthetic-cnoc]
-          [--compare route|quant|strict] [--build-dir DIR]
+Usage: $0 [--quant-cnoc] [--strict-attention] [--model toy]
+          [--compare route|quant|strict] [--build-dir DIR] [--matmul-ctx-slots N]
 
   --quant-cnoc  Use a separate CNOC_QUANT_GOLDEN=ON build and compare
                 type4/type5 traces with integer Q4.4 cNoC semantics.
   --strict-attention
                 Include type5 Attention numeric fields in quantized comparison.
-  --model       Select the workload model. Default: toy.
+  --model       Select the workload model. Only toy is supported. Default: toy.
   --compare     Select comparison strictness. Default: route for non-quant
                 builds, quant for --quant-cnoc, strict for --strict-attention.
   --build-dir   Override the CMake build directory.
+  --matmul-ctx-slots  Compile Router with the requested MatMul/Linear context slots (1-4).
 USAGE
 }
 
@@ -38,7 +40,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --model)
       if [[ $# -lt 2 ]]; then
-        echo "[ERROR] --model requires toy, synthetic-cnoc, or medium-synthetic-cnoc." >&2
+        echo "[ERROR] --model requires toy." >&2
         usage
         exit 2
       fi
@@ -64,6 +66,15 @@ while [[ $# -gt 0 ]]; do
       BUILD_DIR_SET=1
       shift 2
       ;;
+    --matmul-ctx-slots)
+      if [[ $# -lt 2 ]]; then
+        echo "[ERROR] --matmul-ctx-slots requires an integer argument." >&2
+        usage
+        exit 2
+      fi
+      MATMUL_CTX_SLOTS="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -76,8 +87,21 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "${MATMUL_CTX_SLOTS}" in
+  ''|*[!0-9]*)
+    echo "[ERROR] --matmul-ctx-slots must be a positive integer." >&2
+    usage
+    exit 2
+    ;;
+esac
+if [[ "${MATMUL_CTX_SLOTS}" -lt 1 || "${MATMUL_CTX_SLOTS}" -gt 4 ]]; then
+  echo "[ERROR] --matmul-ctx-slots must be in the range [1, 4]." >&2
+  usage
+  exit 2
+fi
+
 case "${MODEL}" in
-  toy|synthetic-cnoc|medium-synthetic-cnoc) ;;
+  toy) ;;
   *)
     echo "[ERROR] Unsupported model: ${MODEL}" >&2
     usage
@@ -116,166 +140,58 @@ esac
 
 if [[ "${BUILD_DIR_SET}" == "0" ]]; then
   if [[ "${QUANT_CNOC}" == "1" ]]; then
-    BUILD_DIR="${ROOT_DIR}/build_cnoc_quant"
+    if [[ "${MATMUL_CTX_SLOTS}" == "1" ]]; then
+      BUILD_DIR="${ROOT_DIR}/build_cnoc_quant"
+    else
+      BUILD_DIR="${ROOT_DIR}/build_cnoc_quant_matmul_s${MATMUL_CTX_SLOTS}"
+    fi
   else
-    BUILD_DIR="${ROOT_DIR}/build"
+    if [[ "${MATMUL_CTX_SLOTS}" == "1" ]]; then
+      BUILD_DIR="${ROOT_DIR}/build"
+    else
+      BUILD_DIR="${ROOT_DIR}/build_matmul_s${MATMUL_CTX_SLOTS}"
+    fi
   fi
 elif [[ "${BUILD_DIR}" != /* ]]; then
   BUILD_DIR="${ROOT_DIR}/${BUILD_DIR}"
 fi
 
 TRACE_DIR="${BUILD_DIR}/trace_regression"
-LOCK_DIR="${TRACE_DIR}.lock"
-MODEL_DIR="${TRACE_DIR}/m"
+LOCK_FILE="${ROOT_DIR}/.rtl_trace_regression.lockfile"
+LEGACY_LOCK_DIR="${ROOT_DIR}/.rtl_trace_regression.lock"
 
 mkdir -p "${TRACE_DIR}"
 
-while ! mkdir "${LOCK_DIR}" 2>/dev/null; do
-  echo "[INFO] Waiting for another trace regression to finish..."
+if [[ -d "${LEGACY_LOCK_DIR}" ]]; then
+  rmdir "${LEGACY_LOCK_DIR}" 2>/dev/null || true
+fi
+
+exec 9>"${LOCK_FILE}"
+while ! flock -n 9; do
+  echo "[INFO] Waiting for another trace regression to finish writing shared trace.log..."
   sleep 1
 done
-trap 'rmdir "${LOCK_DIR}"' EXIT
+trap 'flock -u 9' EXIT
 
 if [[ "${QUANT_CNOC}" == "1" ]]; then
-  cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCNOC_QUANT_GOLDEN=ON -DENABLE_CNOC_MFU=ON
+  cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCNOC_QUANT_GOLDEN=ON -DENABLE_CNOC_MFU=ON -DMATMUL_CTX_SLOTS="${MATMUL_CTX_SLOTS}"
 else
-  cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCNOC_QUANT_GOLDEN=OFF -DENABLE_CNOC_MFU=OFF
+  cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCNOC_QUANT_GOLDEN=OFF -DENABLE_CNOC_MFU=OFF -DMATMUL_CTX_SLOTS="${MATMUL_CTX_SLOTS}"
 fi
 cmake --build "${BUILD_DIR}" -j"$(nproc)"
 
-MODEL_ARGS=()
-if [[ "${MODEL}" == "synthetic-cnoc" || "${MODEL}" == "medium-synthetic-cnoc" ]]; then
-  mkdir -p "${MODEL_DIR}"
-  MODEL_FILE="${MODEL_DIR}/mdl.txt"
-  WEIGHT_FILE="${MODEL_DIR}/w.txt"
-  INPUT_FILE="${MODEL_DIR}/in.txt"
-
-  if [[ "${MODEL}" == "medium-synthetic-cnoc" ]]; then
-    cat > "${MODEL_FILE}" <<'MODEL_EOF'
-Input 16 1 1
-Embedding 32 16
-MatMul 16 64
-MatMul 64 128
-GeGLU 64
-MatMul 64 64
-Add 64 1
-MatMul 64 16
-MODEL_EOF
-
-    : > "${WEIGHT_FILE}"
-    for row in $(seq 0 31); do
-      for col in $(seq 0 15); do
-        awk "BEGIN { printf \"%.4f%s\", ((((${row}+${col}) % 7) - 3) / 16.0), (${col} == 15) ? \"\\n\" : \" \" }" \
-          >> "${WEIGHT_FILE}"
-      done
-    done
-    for row in $(seq 0 63); do
-      for col in $(seq 0 15); do
-        awk "BEGIN { printf \"%.4f \", ((((${row}*3+${col}) % 9) - 4) / 16.0) }" \
-          >> "${WEIGHT_FILE}"
-      done
-      printf '0.0000\n' >> "${WEIGHT_FILE}"
-    done
-    for row in $(seq 0 127); do
-      for col in $(seq 0 63); do
-        awk "BEGIN { printf \"%.4f \", ((((${row}+${col}*5) % 11) - 5) / 32.0) }" \
-          >> "${WEIGHT_FILE}"
-      done
-      printf '0.0000\n' >> "${WEIGHT_FILE}"
-    done
-    for row in $(seq 0 63); do
-      for col in $(seq 0 63); do
-        awk "BEGIN { printf \"%.4f \", (${row} == ${col}) ? 0.5000 : ((((${row}+${col}) % 5) - 2) / 64.0) }" \
-          >> "${WEIGHT_FILE}"
-      done
-      printf '0.0000\n' >> "${WEIGHT_FILE}"
-    done
-    for row in $(seq 0 15); do
-      for col in $(seq 0 63); do
-        awk "BEGIN { printf \"%.4f \", ((((${row}*7+${col}) % 13) - 6) / 64.0) }" \
-          >> "${WEIGHT_FILE}"
-      done
-      printf '0.0000\n' >> "${WEIGHT_FILE}"
-    done
-
-    cat > "${INPUT_FILE}" <<'INPUT_EOF'
-1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
-INPUT_EOF
-  else
-  cat > "${MODEL_FILE}" <<'MODEL_EOF'
-Input 4 1 1
-Embedding 8 4
-MatMul 4 8
-Attention 8 4 2 2
-MatMul 4 8
-GeGLU 4
-MatMul 4 4
-Add 4 1
-MatMul 4 2
-MODEL_EOF
-
-  : > "${WEIGHT_FILE}"
-  # Embedding 8x4.  Input tokens below use ids 1..4, but all rows are present
-  # so the model satisfies the normal NoCDAS weight loader contract.
-  for row in 0 1 2 3 4 5 6 7; do
-    printf '%s %s %s %s\n' \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}+1) / 16.0 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}+2) / 16.0 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}+3) / 16.0 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}+4) / 16.0 }")" \
-      >> "${WEIGHT_FILE}"
-  done
-  # MatMul 4->8 used as Q/K/V projection for Attention.
-  for row in 0 1 2 3 4 5 6 7; do
-    printf '%s %s %s %s 0.0000\n' \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}%4 == 0) ? 0.7500 : 0.1250 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}%4 == 1) ? 0.7500 : -0.1250 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}%4 == 2) ? 0.7500 : 0.2500 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}%4 == 3) ? 0.7500 : -0.2500 }")" \
-      >> "${WEIGHT_FILE}"
-  done
-  # MatMul 4->8 feeding GeGLU.
-  for row in 0 1 2 3 4 5 6 7; do
-    printf '%s %s %s %s 0.0000\n' \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}+1) / 32.0 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}+2) / -32.0 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}+3) / 32.0 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row}+4) / -32.0 }")" \
-      >> "${WEIGHT_FILE}"
-  done
-  # MatMul 4->4 after GeGLU.
-  for row in 0 1 2 3; do
-    printf '%s %s %s %s 0.0000\n' \
-      "$(awk "BEGIN { printf \"%.4f\", (${row} == 0) ? 1.0000 : 0.0000 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row} == 1) ? 1.0000 : 0.0000 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row} == 2) ? 1.0000 : 0.0000 }")" \
-      "$(awk "BEGIN { printf \"%.4f\", (${row} == 3) ? 1.0000 : 0.0000 }")" \
-      >> "${WEIGHT_FILE}"
-  done
-  # Final MatMul 4->2.
-  cat >> "${WEIGHT_FILE}" <<'WEIGHT_EOF'
-1.0000 0.0000 0.5000 0.0000 0.0000
-0.0000 1.0000 0.0000 0.5000 0.0000
-WEIGHT_EOF
-
-  cat > "${INPUT_FILE}" <<'INPUT_EOF'
-1 2 3 4
-INPUT_EOF
-  fi
-
-  MODEL_ARGS=(-NNmodel "${MODEL_FILE}" -NNweight "${WEIGHT_FILE}" -NNinput "${INPUT_FILE}")
-fi
-
 (
   cd "${ROOT_DIR}"
-  "${BUILD_DIR}/NoCDASim" "${MODEL_ARGS[@]}" -trace
+  rm -f trace.log
+  "${BUILD_DIR}/NoCDASim" -trace
   if [[ "${QUANT_CNOC}" == "1" ]]; then
     cp trace.log "${TRACE_DIR}/trace_${MODEL}_cpp_quant_golden.log"
   else
     cp trace.log "${TRACE_DIR}/trace_${MODEL}_cpp_golden.log"
   fi
 
-  "${BUILD_DIR}/NoCDASim" "${MODEL_ARGS[@]}" -rtl_router -trace
+  rm -f trace.log
+  "${BUILD_DIR}/NoCDASim" -rtl_router -trace
   if [[ "${QUANT_CNOC}" == "1" ]]; then
     cp trace.log "${TRACE_DIR}/trace_${MODEL}_rtl_quant_candidate.log"
   else

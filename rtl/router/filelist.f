@@ -11,8 +11,8 @@ rtl/router/mfu/alu/mfu_alu_add.sv
 rtl/router/mfu/alu/mfu_int8_mul8.sv
 rtl/router/mfu/alu/mfu_alu_swiglu.sv
 rtl/router/mfu/alu/mfu_alu_geglu.sv
+rtl/router/mfu/alu/mfu_lut_exp.sv
 rtl/router/mfu/alu/mfu_alu_attention.sv
-rtl/router/mfu/alu/mfu_alu_default.sv
 rtl/router/mfu/mfu_alu.sv
 rtl/router/mfu/mfu_arbiter.sv
 rtl/router/mfu/cnoc_mfu.sv

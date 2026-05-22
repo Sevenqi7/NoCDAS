@@ -13,6 +13,7 @@ module switch_allocator #(
     input  router_ports_pkg::router_pipe_entry_t va_entry_i [NUM_PORTS],
     input  router_ports_pkg::router_pipe_entry_t out_entry_i [NUM_PORTS],
     input  logic [NUM_PORTS-1:0] output_commit_fire_i,
+    input  logic [NUM_PORTS-1:0] mfu_issue_eligible_i,
 
     output logic [NUM_PORTS-1:0] va_fire_o,
     output logic [2:0] crossbar_select_o [NUM_PORTS],
@@ -97,6 +98,8 @@ module switch_allocator #(
             if (!selected_found_winner &&
                 va_entry_i[selected_candidate_port].valid &&
                 (va_entry_i[selected_candidate_port].route_sel == 3'(out_idx)) &&
+                (!(va_entry_i[selected_candidate_port].may_need_mfu) ||
+                 mfu_issue_eligible_i[selected_candidate_port]) &&
                 (va_entry_i[selected_candidate_port].traffic_class == selected_class)) begin
               selected_winner = 3'(selected_candidate_port);
               selected_found_winner = 1'b1;

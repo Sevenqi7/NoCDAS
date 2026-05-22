@@ -106,6 +106,8 @@ module router_unit_tb;
   route_path_t iu_route_path;
   logic iu_may_need_mfu;
   router_traffic_class_e iu_traffic_class;
+  attention_ctx_status_t iu_attention_ctx_status;
+  matmul_ctx_status_t iu_matmul_ctx_status;
   flit_meta_t iu_revisit_meta;
   route_path_t iu_revisit_route_path;
   flit_meta_t iu_exhausted_route_meta;
@@ -120,6 +122,8 @@ module router_unit_tb;
       .reset(reset),
       .rinport_data_i(iu_data),
       .rinport_ctrl_i(iu_ctrl),
+      .attention_ctx_status_i(iu_attention_ctx_status),
+      .matmul_ctx_status_i(iu_matmul_ctx_status),
       .rinport_x_cur_i(iu_ctrl.x_cur),
       .rinport_y_cur_i(iu_ctrl.y_cur),
       .rinport_channel_i(iu_ctrl.in_channel),
@@ -191,6 +195,7 @@ module router_unit_tb;
   router_pipe_entry_t sw_va_entry [NUM_PORTS];
   router_pipe_entry_t sw_out_entry [NUM_PORTS];
   logic [NUM_PORTS-1:0] sw_output_commit_fire;
+  logic [NUM_PORTS-1:0] sw_mfu_issue_eligible;
   logic [NUM_PORTS-1:0] sw_va_fire;
   logic [2:0] sw_crossbar_select [NUM_PORTS];
   logic sw_crossbar_valid [NUM_PORTS];
@@ -204,6 +209,7 @@ module router_unit_tb;
       .va_entry_i(sw_va_entry),
       .out_entry_i(sw_out_entry),
       .output_commit_fire_i(sw_output_commit_fire),
+      .mfu_issue_eligible_i(sw_mfu_issue_eligible),
       .va_fire_o(sw_va_fire),
       .crossbar_select_o(sw_crossbar_select),
       .crossbar_valid_o(sw_crossbar_valid)
@@ -213,6 +219,7 @@ module router_unit_tb;
     int i;
     begin
       sw_output_commit_fire = '0;
+      sw_mfu_issue_eligible = '1;
       for (i = 0; i < NUM_PORTS; i++) begin
         sw_va_entry[i] = '0;
         sw_out_entry[i] = '0;
@@ -226,12 +233,21 @@ module router_unit_tb;
   router_pipe_entry_t vca_issue [NUM_PORTS];
   routport_flow_t vca_flow [NUM_PORTS];
   logic [NUM_PORTS-1:0] vca_va_fire;
-  logic [NUM_PORTS-1:0] vca_output_commit_fire;
-  logic [NUM_PORTS-1:0] vca_output_mfu_selected;
-  router_pipe_entry_t vca_commit_entry [NUM_PORTS];
+  logic [NUM_PORTS-1:0] vca_output_release_valid;
+  logic [VC_ID_W-1:0] vca_output_release_vc [NUM_PORTS];
   flit_meta_t vca_mfu_emit_meta;
   logic [NUM_PORTS-1:0] vca_issue_pop;
   router_pipe_entry_t vca_va_entry [NUM_PORTS];
+  attention_ctx_status_t vca_attention_ctx_status;
+  matmul_ctx_status_t vca_matmul_ctx_status;
+`ifdef ENABLE_CNOC_MFU
+  logic vca_cnoc_attention_claim_valid;
+  logic [2:0] vca_cnoc_attention_claim_src_port;
+  logic [VC_ID_W-1:0] vca_cnoc_attention_claim_src_vc;
+  logic vca_cnoc_data_claim_valid;
+  logic [2:0] vca_cnoc_data_claim_src_port;
+  logic [VC_ID_W-1:0] vca_cnoc_data_claim_src_vc;
+`endif
 
   vc_allocator #(
       .NUM_PORTS(NUM_PORTS),
@@ -241,15 +257,24 @@ module router_unit_tb;
       .clk(clk),
       .reset(reset),
       .issue_entry_i(vca_issue),
+      .attention_ctx_status_i(vca_attention_ctx_status),
+      .matmul_ctx_status_i(vca_matmul_ctx_status),
       .routport_flow_i(vca_flow),
       .va_fire_i(vca_va_fire),
-      .output_commit_fire_i(vca_output_commit_fire),
-      .output_mfu_selected_i(vca_output_mfu_selected),
-      .output_commit_entry_i(vca_commit_entry),
+      .output_release_valid_i(vca_output_release_valid),
+      .output_release_vc_i(vca_output_release_vc),
       .mfu_emit_valid_i(1'b0),
       .mfu_emit_out_sel_i(ROUTER_PORT_INV),
       .mfu_emit_meta_i(vca_mfu_emit_meta),
       .mfu_emit_vc_id_i('0),
+`ifdef ENABLE_CNOC_MFU
+      .cnoc_attention_claim_valid_o(vca_cnoc_attention_claim_valid),
+      .cnoc_attention_claim_src_port_o(vca_cnoc_attention_claim_src_port),
+      .cnoc_attention_claim_src_vc_o(vca_cnoc_attention_claim_src_vc),
+      .cnoc_data_claim_valid_o(vca_cnoc_data_claim_valid),
+      .cnoc_data_claim_src_port_o(vca_cnoc_data_claim_src_port),
+      .cnoc_data_claim_src_vc_o(vca_cnoc_data_claim_src_vc),
+`endif
       .issue_pop_o(vca_issue_pop),
       .va_entry_o(vca_va_entry)
   );
@@ -259,14 +284,15 @@ module router_unit_tb;
     begin
       for (i = 0; i < NUM_PORTS; i++) begin
         vca_issue[i] = '0;
-        vca_commit_entry[i] = '0;
+        vca_output_release_vc[i] = '0;
         vca_flow[i].state_ready = 1'b1;
         vca_flow[i].downstream_vc_idle_mask = '1;
         vca_flow[i].downstream_vc_credit_mask = '1;
       end
       vca_va_fire = '0;
-      vca_output_commit_fire = '0;
-      vca_output_mfu_selected = '0;
+      vca_output_release_valid = '0;
+      vca_attention_ctx_status = '0;
+      vca_matmul_ctx_status = '0;
       vca_mfu_emit_meta = '0;
     end
   endtask
@@ -300,13 +326,13 @@ module router_unit_tb;
       #1;
       dst_vc = vca_va_entry[ROUTER_PORT_LOCAL].dst_vc;
       vca_va_fire[ROUTER_PORT_LOCAL] = 1'b1;
-      vca_output_commit_fire[out_port] = 1'b1;
-      vca_commit_entry[out_port] = vca_va_entry[ROUTER_PORT_LOCAL];
+      vca_output_release_valid[out_port] = 1'b1;
+      vca_output_release_vc[out_port] = vca_va_entry[ROUTER_PORT_LOCAL].dst_vc;
       @(posedge clk);
       #1;
       vca_va_fire[ROUTER_PORT_LOCAL] = 1'b0;
-      vca_output_commit_fire[out_port] = 1'b0;
-      vca_commit_entry[out_port] = '0;
+      vca_output_release_valid[out_port] = 1'b0;
+      vca_output_release_vc[out_port] = '0;
       @(negedge clk);
     end
   endtask
@@ -375,12 +401,14 @@ module router_unit_tb;
   logic [FLIT_W-1:0] alu_wrap_flit_out;
   flit_meta_t alu_wrap_meta_out;
   logic signed [31:0] alu_wrap_scalar_out;
+  attention_ctx_status_t alu_wrap_attention_ctx;
   mfu_alu_ctrl_t alu_wrap_ctrl;
   mfu_alu_ctx_t alu_wrap_ctx;
   mfu_alu_data_rsp_t alu_wrap_data_rsp;
   mfu_alu_data_req_t alu_wrap_data_req;
   mfu_alu_op_t alu_wrap_op;
   mfu_alu_result_t alu_wrap_result;
+  matmul_ctx_status_t alu_wrap_matmul_ctx;
 
   assign alu_wrap_ctrl.start = alu_wrap_start;
   assign alu_wrap_ctrl.fetch_en = 1'b0;
@@ -408,7 +436,9 @@ module router_unit_tb;
       .ctx_i(alu_wrap_ctx),
       .data_rsp_i(alu_wrap_data_rsp),
       .data_req_o(alu_wrap_data_req),
-      .result_o(alu_wrap_result)
+      .result_o(alu_wrap_result),
+      .attention_ctx_o(alu_wrap_attention_ctx),
+      .matmul_ctx_o(alu_wrap_matmul_ctx)
   );
   assign alu_wrap_busy = alu_wrap_result.busy;
   assign alu_wrap_valid = alu_wrap_result.valid;
@@ -436,16 +466,13 @@ module router_unit_tb;
   logic alu_geglu_busy;
   logic alu_geglu_valid;
   logic signed [31:0] alu_geglu_scalar_out;
-  logic [FLIT_W-1:0] alu_default_flit_out;
-  flit_meta_t alu_default_meta_out;
-  logic alu_default_busy;
-  logic alu_default_valid;
-  logic signed [31:0] alu_default_scalar_out;
   logic alu_swiglu_mul_req;
+  logic alu_swiglu_mul_valid;
   logic signed [7:0] alu_swiglu_mul_lhs [0:7];
   logic signed [7:0] alu_swiglu_mul_rhs [0:7];
   logic signed [15:0] alu_swiglu_mul_product [0:7];
   logic alu_geglu_mul_req;
+  logic alu_geglu_mul_valid;
   logic signed [7:0] alu_geglu_mul_lhs [0:7];
   logic signed [7:0] alu_geglu_mul_rhs [0:7];
   logic signed [15:0] alu_geglu_mul_product [0:7];
@@ -487,10 +514,15 @@ module router_unit_tb;
       .mul_req_o(alu_swiglu_mul_req),
       .mul_lhs_o(alu_swiglu_mul_lhs),
       .mul_rhs_o(alu_swiglu_mul_rhs),
+      .mul_rsp_valid_i(alu_swiglu_mul_valid),
       .mul_product_i(alu_swiglu_mul_product)
   );
 
   mfu_int8_mul8 alu_swiglu_mul8_i (
+      .clk_i(clk),
+      .reset_i(reset),
+      .valid_i(alu_swiglu_mul_req),
+      .valid_o(alu_swiglu_mul_valid),
       .lhs_i(alu_swiglu_mul_lhs),
       .rhs_i(alu_swiglu_mul_rhs),
       .product_o(alu_swiglu_mul_product)
@@ -515,30 +547,18 @@ module router_unit_tb;
       .mul_req_o(alu_geglu_mul_req),
       .mul_lhs_o(alu_geglu_mul_lhs),
       .mul_rhs_o(alu_geglu_mul_rhs),
+      .mul_rsp_valid_i(alu_geglu_mul_valid),
       .mul_product_i(alu_geglu_mul_product)
   );
 
   mfu_int8_mul8 alu_geglu_mul8_i (
+      .clk_i(clk),
+      .reset_i(reset),
+      .valid_i(alu_geglu_mul_req),
+      .valid_o(alu_geglu_mul_valid),
       .lhs_i(alu_geglu_mul_lhs),
       .rhs_i(alu_geglu_mul_rhs),
       .product_o(alu_geglu_mul_product)
-  );
-
-  mfu_alu_default #(
-      .FLIT_W(FLIT_W)
-  ) mfu_alu_default_i (
-      .clk_i(clk),
-      .reset_i(reset),
-      .start_i(alu_leaf_start),
-      .flit_i(alu_leaf_flit_in),
-      .meta_i(alu_leaf_meta_in),
-      .scalar_a_i(alu_leaf_op_a),
-      .scalar_b_i(alu_leaf_op_b),
-      .busy_o(alu_default_busy),
-      .valid_o(alu_default_valid),
-      .result_flit_o(alu_default_flit_out),
-      .result_meta_o(alu_default_meta_out),
-      .result_scalar_o(alu_default_scalar_out)
   );
 
   logic att_fetch_en;
@@ -556,22 +576,33 @@ module router_unit_tb;
   mfu_alu_data_req_t att_data_req;
   mfu_alu_data_rsp_t att_data_rsp;
   mfu_alu_ctx_t att_ctx;
+  logic [2:0] att_stream_port_sel;
+  logic [VC_ID_W-1:0] att_stream_vc_sel;
+  logic [VC_ID_W-1:0] att_vc_id_sel;
+  logic [2:0] att_out_sel_sel;
   mfu_alu_op_t att_op;
   logic att_mul_req;
+  logic att_mul_valid;
   logic signed [7:0] att_mul_lhs [0:7];
   logic signed [7:0] att_mul_rhs [0:7];
   logic signed [15:0] att_mul_product [0:7];
+  logic att_ctx_valid;
+  logic [2:0] att_ctx_stream_port;
+  logic [VC_ID_W-1:0] att_ctx_stream_vc;
   integer att_read_idx;
   integer att_task_init_idx;
 
-  assign att_ctx.stream_port = ROUTER_PORT_LOCAL;
-  assign att_ctx.stream_vc = 3'd0;
-  assign att_ctx.vc_id = 3'd0;
-  assign att_ctx.out_sel = ROUTER_PORT_LOCAL;
-  assign att_ctx.kv_token_count = 16'd1;
-  assign att_ctx.task_count = att_task_count;
-  assign att_ctx.task_ids_flat = att_task_ids_flat;
-  assign att_ctx.weight_row_size = 16'd0;
+  always_comb begin : proc_attention_ctx_pack
+    att_ctx = '0;
+    att_ctx.stream_port = att_stream_port_sel;
+    att_ctx.stream_vc = att_stream_vc_sel;
+    att_ctx.vc_id = att_vc_id_sel;
+    att_ctx.out_sel = att_out_sel_sel;
+    att_ctx.kv_token_count = 16'd1;
+    att_ctx.task_count = att_task_count;
+    att_ctx.task_ids_flat = att_task_ids_flat;
+    att_ctx.weight_row_size = 16'd0;
+  end
   assign att_op.opcode = 5'd23;
   assign att_op.msg_type = ROUTER_MSG_COMP;
   assign att_op.is_type5 = 1'b1;
@@ -610,13 +641,21 @@ module router_unit_tb;
       .result_valid_o(att_valid),
       .result_flit_o(att_flit_out),
       .result_meta_o(att_meta_out),
+      .attention_ctx_valid_o(att_ctx_valid),
+      .attention_ctx_stream_port_o(att_ctx_stream_port),
+      .attention_ctx_stream_vc_o(att_ctx_stream_vc),
       .mul_req_o(att_mul_req),
       .mul_lhs_o(att_mul_lhs),
       .mul_rhs_o(att_mul_rhs),
+      .mul_rsp_valid_i(att_mul_valid),
       .mul_product_i(att_mul_product)
   );
 
   mfu_int8_mul8 att_mul8_i (
+      .clk_i(clk),
+      .reset_i(reset),
+      .valid_i(att_mul_req),
+      .valid_o(att_mul_valid),
       .lhs_i(att_mul_lhs),
       .rhs_i(att_mul_rhs),
       .product_o(att_mul_product)
@@ -983,7 +1022,6 @@ module router_unit_tb;
     logic [2:0] dst_y;
     logic [VC_ID_W-1:0] vc_id;
     begin
-      $display("[TB][INFO] running stress suite with seed=%0d", seed);
       void'($urandom(seed));
       accepted = 0;
       emitted = 0;
@@ -1108,6 +1146,8 @@ module router_unit_tb;
     begin
     iu_data = '0;
     iu_ctrl = '0;
+    iu_attention_ctx_status = '0;
+    iu_matmul_ctx_status = '0;
     iu_issue_pop = 1'b0;
     iu_ctrl.x_cur = 3'd0;
     iu_ctrl.y_cur = 3'd0;
@@ -1167,29 +1207,29 @@ module router_unit_tb;
     iu_push_with_route(
         make_meta(ROUTER_FLIT_HEAD, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                   3'd2, 3'd0, 1'b1, 8'd2, 8'd0, ROUTER_PORT_WEST,
-                  1'b1, 5'd15, 10'd3, 8'h11),
+                  1'b1, 5'd18, 10'd3, 8'h11),
         make_route_path(1'b1, 8'd2, 8'd0, ROUTER_PORT_WEST, 1'b1),
         3'd0);
     iu_expect_and_pop(ROUTER_PORT_WEST, "source-route head");
 
     iu_push(make_meta(ROUTER_FLIT_BODY, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                       3'd2, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                      1'b1, 5'd15, 10'd4, 8'h22), 3'd0);
+                      1'b1, 5'd18, 10'd4, 8'h22), 3'd0);
     iu_expect_and_pop(ROUTER_PORT_WEST, "source-route body");
 
     iu_push(make_meta(ROUTER_FLIT_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                       3'd2, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                      1'b1, 5'd15, 10'd5, 8'h33), 3'd0);
+                      1'b1, 5'd18, 10'd5, 8'h33), 3'd0);
     iu_expect_and_pop(ROUTER_PORT_WEST, "source-route tail");
 
     iu_push(make_meta(ROUTER_FLIT_BODY, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                       3'd2, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                      1'b1, 5'd15, 10'd6, 8'h44), 3'd0);
+                      1'b1, 5'd18, 10'd6, 8'h44), 3'd0);
     iu_expect_and_pop(ROUTER_PORT_EAST, "source-route context clear");
 
     iu_revisit_meta = make_meta(ROUTER_FLIT_HEAD, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                                 3'd2, 3'd0, 1'b1, 8'd5, 8'd4, ROUTER_PORT_EAST,
-                                1'b1, 5'd15, 10'd7, 8'h55);
+                                1'b1, 5'd18, 10'd7, 8'h55);
     iu_revisit_route_path =
         make_route_path(1'b1, 8'd5, 8'd4, ROUTER_PORT_EAST, 1'b0);
     iu_revisit_route_path.route_seq[1 * ROUTE_PORT_W +: ROUTE_PORT_W] =
@@ -1339,14 +1379,14 @@ module router_unit_tb;
     iu_push_with_route(
         make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                   3'd2, 3'd0, 1'b1, 8'd1, 8'd0, ROUTER_PORT_WEST,
-                  1'b1, 5'd15, 10'd8, 8'h66),
+                  1'b1, 5'd18, 10'd8, 8'h66),
         make_route_path(1'b1, 8'd1, 8'd0, ROUTER_PORT_WEST, 1'b1),
         3'd0);
     iu_expect_and_pop(ROUTER_PORT_WEST, "source-route head-tail");
 
     iu_push(make_meta(ROUTER_FLIT_BODY, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                       3'd2, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                      1'b1, 5'd15, 10'd9, 8'h77), 3'd0);
+                      1'b1, 5'd18, 10'd9, 8'h77), 3'd0);
     iu_expect_and_pop(ROUTER_PORT_EAST, "source-route head-tail context clear");
 
     // If the stored route pointer has already consumed route_len, source routing
@@ -1355,7 +1395,7 @@ module router_unit_tb;
     iu_exhausted_route_meta =
         make_meta(ROUTER_FLIT_HEAD, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                   3'd2, 3'd0, 1'b1, 8'd1, 8'd1, ROUTER_PORT_WEST,
-                  1'b1, 5'd15, 10'd10, 8'h88);
+                  1'b1, 5'd18, 10'd10, 8'h88);
     iu_exhausted_route_path =
         make_route_path(1'b1, 8'd1, 8'd1, ROUTER_PORT_WEST, 1'b1);
     iu_push_with_route(iu_exhausted_route_meta, iu_exhausted_route_path, 3'd0);
@@ -1363,7 +1403,7 @@ module router_unit_tb;
 
     iu_push(make_meta(ROUTER_FLIT_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                       3'd2, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
-                      1'b1, 5'd15, 10'd11, 8'h99), 3'd0);
+                      1'b1, 5'd18, 10'd11, 8'h99), 3'd0);
     iu_expect_and_pop(ROUTER_PORT_EAST, "source-route exhausted tail falls back to XY");
 
     end
@@ -1473,6 +1513,76 @@ module router_unit_tb;
     #1;
     check(!vca_issue_pop[ROUTER_PORT_LOCAL], "head transfer ready despite no idle VC");
 
+    // A VC released by output commit is visible to new heads on the next cycle,
+    // not through a same-cycle release-to-allocation bypass.
+    clear_vc_allocator_inputs();
+    vca_issue[ROUTER_PORT_LOCAL].valid = 1'b1;
+    vca_issue[ROUTER_PORT_LOCAL].src_port = ROUTER_PORT_LOCAL;
+    vca_issue[ROUTER_PORT_LOCAL].src_vc = 3'd1;
+    vca_issue[ROUTER_PORT_LOCAL].route_sel = ROUTER_PORT_EAST;
+    vca_issue[ROUTER_PORT_LOCAL].head_like = 1'b1;
+    vca_issue[ROUTER_PORT_LOCAL].tail_like = 1'b1;
+    vca_issue[ROUTER_PORT_LOCAL].traffic_class = ROUTER_TRAFFIC_REGULAR;
+    vca_issue[ROUTER_PORT_LOCAL].meta =
+        make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_MEM_READ, ROUTER_TRAFFIC_REGULAR,
+                  3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
+                  1'b0, 5'd0, 10'd0, 8'h00);
+    vca_flow[ROUTER_PORT_EAST].downstream_vc_idle_mask = 8'b0000_0001;
+    vca_flow[ROUTER_PORT_EAST].downstream_vc_credit_mask = 8'b0000_0001;
+    #1;
+    check(vca_issue_pop[ROUTER_PORT_LOCAL],
+          "VC allocator did not reserve VC0 for release-bypass test");
+    @(posedge clk);
+    #1;
+    vca_issue[ROUTER_PORT_LOCAL] = '0;
+    @(negedge clk);
+    #1;
+    vca_va_fire[ROUTER_PORT_LOCAL] = 1'b1;
+    @(posedge clk);
+    #1;
+    vca_va_fire[ROUTER_PORT_LOCAL] = 1'b0;
+    @(negedge clk);
+    #1;
+
+    vca_issue[ROUTER_PORT_LOCAL].valid = 1'b1;
+    vca_issue[ROUTER_PORT_LOCAL].src_port = ROUTER_PORT_LOCAL;
+    vca_issue[ROUTER_PORT_LOCAL].src_vc = 3'd2;
+    vca_issue[ROUTER_PORT_LOCAL].route_sel = ROUTER_PORT_EAST;
+    vca_issue[ROUTER_PORT_LOCAL].head_like = 1'b1;
+    vca_issue[ROUTER_PORT_LOCAL].tail_like = 1'b1;
+    vca_issue[ROUTER_PORT_LOCAL].traffic_class = ROUTER_TRAFFIC_REGULAR;
+    vca_issue[ROUTER_PORT_LOCAL].meta =
+        make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_MEM_READ, ROUTER_TRAFFIC_REGULAR,
+                  3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
+                  1'b0, 5'd0, 10'd0, 8'h00);
+    vca_output_release_valid[ROUTER_PORT_EAST] = 1'b1;
+    vca_output_release_vc[ROUTER_PORT_EAST] = 3'd0;
+    #1;
+    check(!vca_issue_pop[ROUTER_PORT_LOCAL],
+          "VC allocator reused a same-cycle released downstream VC");
+    @(posedge clk);
+    #1;
+    vca_output_release_valid[ROUTER_PORT_EAST] = 1'b0;
+    vca_output_release_vc[ROUTER_PORT_EAST] = '0;
+    #1;
+    check(vca_issue_pop[ROUTER_PORT_LOCAL],
+          "VC allocator did not use released downstream VC on the next cycle");
+    @(posedge clk);
+    #1;
+    vca_issue[ROUTER_PORT_LOCAL] = '0;
+    @(negedge clk);
+    #1;
+    vca_va_fire[ROUTER_PORT_LOCAL] = 1'b1;
+    vca_output_release_valid[ROUTER_PORT_EAST] = 1'b1;
+    vca_output_release_vc[ROUTER_PORT_EAST] = 3'd0;
+    @(posedge clk);
+    #1;
+    vca_va_fire[ROUTER_PORT_LOCAL] = 1'b0;
+    vca_output_release_valid[ROUTER_PORT_EAST] = 1'b0;
+    vca_output_release_vc[ROUTER_PORT_EAST] = '0;
+    @(negedge clk);
+    #1;
+
     // Body/tail flits reuse the VC allocated by their head.  They must be
     // blocked by credit on that recorded downstream VC and tail must release the
     // mapping afterwards.
@@ -1498,15 +1608,6 @@ module router_unit_tb;
     #1;
     check(vca_va_entry[ROUTER_PORT_LOCAL].dst_vc == 3'd0,
           "VC allocator body/tail test did not start with regular VC0");
-    vca_va_fire[ROUTER_PORT_LOCAL] = 1'b1;
-    vca_output_commit_fire[ROUTER_PORT_WEST] = 1'b1;
-    vca_commit_entry[ROUTER_PORT_WEST] = vca_va_entry[ROUTER_PORT_LOCAL];
-    @(posedge clk);
-    #1;
-    vca_va_fire[ROUTER_PORT_LOCAL] = 1'b0;
-    vca_output_commit_fire[ROUTER_PORT_WEST] = 1'b0;
-    vca_commit_entry[ROUTER_PORT_WEST] = '0;
-    #1;
 
     vca_issue[ROUTER_PORT_LOCAL].valid = 1'b1;
     vca_issue[ROUTER_PORT_LOCAL].src_port = ROUTER_PORT_LOCAL;
@@ -1521,15 +1622,16 @@ module router_unit_tb;
                   1'b0, 5'd0, 10'd0, 8'h00);
     vca_flow[ROUTER_PORT_WEST].downstream_vc_idle_mask = '0;
     vca_flow[ROUTER_PORT_WEST].downstream_vc_credit_mask = 8'b0000_0001;
-    @(negedge clk);
     #1;
     check(vca_issue_pop[ROUTER_PORT_LOCAL],
-          "VC allocator body did not reuse head allocation with credit");
+          "VC allocator body did not reuse head allocation before head commit");
     @(posedge clk);
     #1;
     vca_issue[ROUTER_PORT_LOCAL] = '0;
     @(negedge clk);
     #1;
+    check(vca_va_entry[ROUTER_PORT_LOCAL].valid,
+          "VC allocator body did not enter VA backlog");
     check(vca_va_entry[ROUTER_PORT_LOCAL].dst_vc == 3'd0,
           "VC allocator body changed downstream VC");
     vca_va_fire[ROUTER_PORT_LOCAL] = 1'b1;
@@ -1559,13 +1661,13 @@ module router_unit_tb;
     @(negedge clk);
     #1;
     vca_va_fire[ROUTER_PORT_LOCAL] = 1'b1;
-    vca_output_commit_fire[ROUTER_PORT_WEST] = 1'b1;
-    vca_commit_entry[ROUTER_PORT_WEST] = vca_va_entry[ROUTER_PORT_LOCAL];
+    vca_output_release_valid[ROUTER_PORT_WEST] = 1'b1;
+    vca_output_release_vc[ROUTER_PORT_WEST] = vca_va_entry[ROUTER_PORT_LOCAL].dst_vc;
     @(posedge clk);
     #1;
     vca_va_fire[ROUTER_PORT_LOCAL] = 1'b0;
-    vca_output_commit_fire[ROUTER_PORT_WEST] = 1'b0;
-    vca_commit_entry[ROUTER_PORT_WEST] = '0;
+    vca_output_release_valid[ROUTER_PORT_WEST] = 1'b0;
+    vca_output_release_vc[ROUTER_PORT_WEST] = '0;
     #1;
     vca_issue[ROUTER_PORT_LOCAL].tail_like = 1'b0;
     vca_issue[ROUTER_PORT_LOCAL].meta =
@@ -1706,13 +1808,34 @@ module router_unit_tb;
     #1;
     alu_wrap_start = 1'b0;
     check(alu_wrap_busy, "GEGLU leaf path did not assert busy while processing");
-    for (top_wait_idx = 0; top_wait_idx < 8 && !alu_wrap_valid;
+    for (top_wait_idx = 0; top_wait_idx < 20 && !alu_wrap_valid;
          top_wait_idx = top_wait_idx + 1) begin
       @(posedge clk);
       #1;
     end
     check(alu_wrap_valid, "GEGLU leaf path did not complete through valid");
     check(!alu_wrap_busy, "GEGLU leaf path should clear busy with valid");
+    @(negedge clk);
+
+    alu_wrap_meta_in = make_meta(ROUTER_FLIT_HEAD_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
+                             3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
+                             1'b1, 5'd31, 10'd0, 8'h00);
+    alu_wrap_meta_in.payload_len = 6'd1;
+    alu_wrap_flit_in = '0;
+    alu_wrap_flit_in[7:0] = 8'h5A;
+    @(negedge clk);
+    alu_wrap_start = 1'b1;
+    @(posedge clk);
+    #1;
+    check(alu_wrap_valid, "unknown opcode passthrough did not assert valid");
+    check(!alu_wrap_busy, "unknown opcode passthrough should not assert busy");
+    check(alu_wrap_flit_out == alu_wrap_flit_in,
+          "unknown opcode passthrough changed flit");
+    check(alu_wrap_meta_out.opcode == 5'd31,
+          "unknown opcode passthrough changed opcode");
+    check(alu_wrap_scalar_out == 32'sd0,
+          "unknown opcode passthrough scalar should be zero");
+    alu_wrap_start = 1'b0;
     @(negedge clk);
 
     end
@@ -1749,7 +1872,7 @@ module router_unit_tb;
     #1;
     alu_leaf_start = 1'b0;
     check(alu_swiglu_busy, "swiglu leaf did not assert busy");
-    for (top_wait_idx = 0; top_wait_idx < 8 && !alu_swiglu_valid;
+    for (top_wait_idx = 0; top_wait_idx < 20 && !alu_swiglu_valid;
          top_wait_idx = top_wait_idx + 1) begin
       @(posedge clk);
       #1;
@@ -1767,7 +1890,7 @@ module router_unit_tb;
     #1;
     alu_leaf_start = 1'b0;
     check(alu_geglu_busy, "geglu leaf did not assert busy");
-    for (top_wait_idx = 0; top_wait_idx < 8 && !alu_geglu_valid;
+    for (top_wait_idx = 0; top_wait_idx < 20 && !alu_geglu_valid;
          top_wait_idx = top_wait_idx + 1) begin
       @(posedge clk);
       #1;
@@ -1775,21 +1898,6 @@ module router_unit_tb;
     check(alu_geglu_valid, "geglu leaf did not assert valid");
     check(alu_geglu_flit_out[7:0] == 8'd0, "geglu leaf lane0 mismatch");
     check(alu_geglu_scalar_out == 32'sd0, "geglu leaf scalar mismatch");
-    @(negedge clk);
-
-    alu_leaf_meta_in.opcode = 5'd31;
-    alu_leaf_flit_in = '0;
-    alu_leaf_flit_in[7:0] = 8'h5A;
-    alu_leaf_op_a = 32'sd0;
-    alu_leaf_op_b = 32'sd16;
-    @(negedge clk);
-    alu_leaf_start = 1'b1;
-    @(posedge clk);
-    #1;
-    check(alu_default_valid, "default leaf did not assert valid");
-    check(alu_default_flit_out[7:0] == 8'd16, "default leaf lane0 mismatch");
-    check(alu_default_scalar_out == 32'sd16, "default leaf scalar mismatch");
-    alu_leaf_start = 1'b0;
     @(negedge clk);
 
     end
@@ -1844,9 +1952,15 @@ module router_unit_tb;
   task automatic run_attention_tests();
     begin
     // Attention helper: KV cache is read through the ALU data request path,
-    // query lanes are captured from type5 head/body payload, and tail streams
-    // K/V data out of the shared-SRAM-shaped test memory.
+    // query lanes are captured from type5 head/body payload, and the leaf now
+    // keeps a single active owner {stream_port, stream_vc} until tail release.
+    // Non-owner Attention traffic should be rejected by Router/MFU gating; if a
+    // malformed flit slips through to the leaf, it must not steal the owner.
     @(negedge clk);
+    att_stream_port_sel = ROUTER_PORT_LOCAL;
+    att_stream_vc_sel = 3'd0;
+    att_vc_id_sel = 3'd0;
+    att_out_sel_sel = ROUTER_PORT_LOCAL;
     att_kv_mem[0] = 8'd16;  // token0 K0 = 1.0
     att_kv_mem[1] = 8'd16;  // token0 K1 = 1.0
     att_kv_mem[2] = 8'd16;  // token0 V0 = 1.0
@@ -1865,6 +1979,33 @@ module router_unit_tb;
     att_fetch_en = 1'b1;
     @(negedge clk);
     att_fetch_en = 1'b0;
+    #1;
+    check(att_ctx_valid, "Attention head did not claim single active context");
+    check(att_ctx_stream_port == ROUTER_PORT_LOCAL,
+          "Attention head captured wrong owner stream_port");
+    check(att_ctx_stream_vc == 3'd0,
+          "Attention head captured wrong owner stream_vc");
+
+    // A conflicting head-like flit must not overwrite the current owner even
+    // if it is presented directly to the leaf.
+    att_stream_vc_sel = 3'd1;
+    att_meta_in = make_meta(ROUTER_FLIT_HEAD, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
+                            3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
+                            1'b1, 5'd23, 10'd0, 8'h00);
+    att_meta_in.payload_len = 6'd1;
+    att_meta_in.psum_offset = 16'd2;
+    att_meta_in.k_dim = 16'd2;
+    att_flit_in = '0;
+    att_flit_in[7:0] = 8'd48;
+    @(negedge clk);
+    att_fetch_en = 1'b1;
+    @(negedge clk);
+    att_fetch_en = 1'b0;
+    #1;
+    check(att_ctx_valid, "Conflicting Attention head unexpectedly cleared owner");
+    check(att_ctx_stream_vc == 3'd0,
+          "Conflicting Attention head stole single active context");
+    att_stream_vc_sel = 3'd0;
 
     att_meta_in = make_meta(ROUTER_FLIT_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
                             3'd1, 3'd0, 1'b0, 8'd0, 8'd0, ROUTER_PORT_INV,
@@ -1878,7 +2019,7 @@ module router_unit_tb;
     @(negedge clk);
     att_fetch_en = 1'b0;
     att_compute_en = 1'b1;
-    for (top_wait_idx = 0; top_wait_idx < 16 && !att_valid;
+    for (top_wait_idx = 0; top_wait_idx < 40 && !att_valid;
          top_wait_idx = top_wait_idx + 1) begin
       @(posedge clk);
       #1;
@@ -1899,8 +2040,10 @@ module router_unit_tb;
     att_release_state = 1'b1;
     @(negedge clk);
     att_release_state = 1'b0;
+    #1;
+    check(!att_ctx_valid, "Attention release did not clear single active context");
 
-    // After tail release, the per-output/per-VC Attention context must be gone.
+    // After tail release, the single active Attention context must be gone.
     // A tail-like flit observed combinationally without compute_fire must not
     // reuse the previous query state and fabricate an output.
     att_meta_in = make_meta(ROUTER_FLIT_TAIL, ROUTER_MSG_COMP, ROUTER_TRAFFIC_COMP,
@@ -1957,14 +2100,14 @@ module router_unit_tb;
     @(negedge clk);
     att_fetch_en = 1'b0;
     att_compute_en = 1'b1;
-    for (top_wait_idx = 0; top_wait_idx < 160 && !att_valid;
+    for (top_wait_idx = 0; top_wait_idx < 320 && !att_valid;
          top_wait_idx = top_wait_idx + 1) begin
       @(posedge clk);
       #1;
     end
     #1;
     check(att_valid, "Attention task_count=32 did not complete");
-    check(top_wait_idx < 160, "Attention task_count=32 likely wrapped task index");
+    check(top_wait_idx < 320, "Attention task_count=32 likely wrapped task index");
     att_compute_en = 1'b0;
     @(negedge clk);
     att_release_state = 1'b1;
@@ -2123,7 +2266,6 @@ module router_unit_tb;
     end
 
     if (errors == 0) begin
-      $display("[TB][PASS] router_unit_tb completed.");
       $finish;
     end else begin
       $display("[TB][FAIL] router_unit_tb found %0d errors.", errors);
