@@ -52,11 +52,7 @@ module mfu_alu_matmul #(
 
   typedef enum logic [2:0] {
     MM_IDLE,
-    MM_LOAD,
-    MM_ISSUE,
-    MM_MUL,
-    MM_MUL_WAIT,
-    MM_REDUCE,
+    MM_RUN,
     MM_TASK_COMMIT,
     MM_DONE
   } matmul_state_e;
@@ -80,13 +76,8 @@ module mfu_alu_matmul #(
   logic signed [ACC_W-1:0] data_sum_q;
   logic [5:0] compute_base_idx_q;
   logic [4:0] task_idx_q;
-  logic [DATA_W-1:0] weight_data_q;
-
-  logic [DATA_ELEMS-1:0] lane_enable_q;
-  logic lane_last_q;
-  logic signed [7:0] mul_lhs_q [0:DATA_ELEMS-1];
-  logic signed [7:0] mul_rhs_q [0:DATA_ELEMS-1];
-  logic signed [15:0] mul_product_q [0:DATA_ELEMS-1];
+  logic [DATA_ELEMS-1:0] rsp_lane_enable_pipe_q [0:1];
+  logic rsp_lane_last_pipe_q [0:1];
   logic signed [ACC_W-1:0] lane_sum_q;
 
   logic data_op;
@@ -114,6 +105,7 @@ module mfu_alu_matmul #(
   logic [31:0] data_req_addr_full;
   logic [SRAM_ADDR_W-1:0] data_req_addr;
   logic data_req_valid;
+  logic issue_chunk;
 
   logic [5:0] load_byte_offset;
   logic [5:0] load_lane_u6;
@@ -150,7 +142,6 @@ module mfu_alu_matmul #(
   int unsigned load_lane_idx;
   int unsigned reduce_lane_idx;
   int unsigned reset_lane_idx;
-  int unsigned seq_lane_idx;
   int unsigned reset_task_idx;
   int unsigned slot_idx;
   int unsigned active_count;
@@ -272,7 +263,7 @@ module mfu_alu_matmul #(
         (task_count_limited != 6'd0) && (state_q == MM_IDLE)) begin
       data_req_valid = 1'b1;
       data_req_addr_full = {16'd0, pkt_meta_i.data_offset};
-    end else if ((state_q == MM_LOAD) && compute_en_i) begin
+    end else if ((state_q == MM_RUN) && issue_chunk) begin
       data_req_valid = 1'b1;
       data_req_addr_full = current_weight_addr_full;
     end
@@ -285,9 +276,11 @@ module mfu_alu_matmul #(
   assign data_req_o.valid = data_req_valid;
   assign data_req_o.bank_sel = 1'b0;
   assign data_req_o.addr = data_req_addr;
-  assign mul_req_o = (state_q == MM_MUL);
-  assign mul_lhs_o = mul_lhs_q;
-  assign mul_rhs_o = mul_rhs_q;
+  assign issue_chunk =
+      compute_en_i && (state_q == MM_RUN) && (compute_base_idx_q < input_payload_len_q);
+  assign mul_req_o = issue_chunk;
+  assign mul_lhs_o = mul_lhs_d;
+  assign mul_rhs_o = mul_rhs_d;
 
   always_comb begin : proc_load_operands
     load_byte_offset = pkt_meta_q.data_offset[5:0] + compute_base_idx_q;
@@ -306,7 +299,7 @@ module mfu_alu_matmul #(
       load_flit_byte[load_lane_idx] =
           pkt_flit_q[(load_byte_offset + load_lane_u6) * 8 +: 8];
       load_weight_byte[load_lane_idx] =
-          weight_data_q[load_lane_idx * DATA_ELEM_W +: DATA_ELEM_W];
+          data_rsp_i.rdata[load_lane_idx * DATA_ELEM_W +: DATA_ELEM_W];
       lane_enable_d[load_lane_idx] =
           ((compute_base_idx_q + load_lane_u6) < input_payload_len_q) &&
           (load_input_idx < pkt_meta_q.psum_offset) &&
@@ -324,13 +317,13 @@ module mfu_alu_matmul #(
     for (reduce_lane_idx = 0; reduce_lane_idx < DATA_ELEMS;
          reduce_lane_idx = reduce_lane_idx + 1) begin
       product_q8 =
-          {{16{mul_product_q[reduce_lane_idx][15]}}, mul_product_q[reduce_lane_idx]};
+          {{16{mul_product_i[reduce_lane_idx][15]}}, mul_product_i[reduce_lane_idx]};
       if (product_q8 >= 32'sd0) begin
         rounded_q4 = (product_q8 + 32'sd8) >>> 4;
       end else begin
         rounded_q4 = -(((-product_q8) + 32'sd8) >>> 4);
       end
-      if (lane_enable_q[reduce_lane_idx]) begin
+      if (rsp_lane_enable_pipe_q[1][reduce_lane_idx]) begin
         lane_sum_d = lane_sum_d + ACC_W'(rounded_q4);
       end
     end
@@ -406,16 +399,14 @@ module mfu_alu_matmul #(
       data_sum_q <= '0;
       compute_base_idx_q <= '0;
       task_idx_q <= '0;
-      weight_data_q <= '0;
-      lane_enable_q <= '0;
-      lane_last_q <= 1'b0;
       lane_sum_q <= '0;
       for (reset_lane_idx = 0; reset_lane_idx < DATA_ELEMS;
            reset_lane_idx = reset_lane_idx + 1) begin
-        mul_lhs_q[reset_lane_idx] <= '0;
-        mul_rhs_q[reset_lane_idx] <= '0;
-        mul_product_q[reset_lane_idx] <= '0;
+        rsp_lane_enable_pipe_q[0][reset_lane_idx] <= 1'b0;
+        rsp_lane_enable_pipe_q[1][reset_lane_idx] <= 1'b0;
       end
+      rsp_lane_last_pipe_q[0] <= 1'b0;
+      rsp_lane_last_pipe_q[1] <= 1'b0;
       for (reset_slot_idx = 0; reset_slot_idx < MATMUL_CTX_SLOTS_MAX; reset_slot_idx = reset_slot_idx + 1) begin
         matmul_active_slot_q[reset_slot_idx] <= '0;
         for (reset_task_idx = 0; reset_task_idx < CNOC_MAX_TASKS;
@@ -452,6 +443,10 @@ module mfu_alu_matmul #(
         task_idx_q <= 5'd0;
         data_sum_q <= '0;
         lane_sum_q <= '0;
+        rsp_lane_enable_pipe_q[0] <= '0;
+        rsp_lane_enable_pipe_q[1] <= '0;
+        rsp_lane_last_pipe_q[0] <= 1'b0;
+        rsp_lane_last_pipe_q[1] <= 1'b0;
         active_slot_q <= active_slot_d;
         task_base_q <= head_like ? '0 :
             {{(ACC_W-8){accum_q[active_slot_d][0][7]}}, accum_q[active_slot_d][0]};
@@ -471,44 +466,29 @@ module mfu_alu_matmul #(
         end else if (fetch_input_len == 6'd0) begin
           state_q <= MM_TASK_COMMIT;
         end else begin
-          state_q <= MM_LOAD;
+          state_q <= MM_RUN;
         end
-      end else if (compute_en_i) begin
+      end else begin
         unique case (state_q)
-          MM_LOAD: begin
-            weight_data_q <= data_rsp_i.rdata;
-            state_q <= MM_ISSUE;
-          end
-          MM_ISSUE: begin
-            lane_enable_q <= lane_enable_d;
-            lane_last_q <= lane_last_d;
-            for (seq_lane_idx = 0; seq_lane_idx < DATA_ELEMS;
-                 seq_lane_idx = seq_lane_idx + 1) begin
-              mul_lhs_q[seq_lane_idx] <= mul_lhs_d[seq_lane_idx];
-              mul_rhs_q[seq_lane_idx] <= mul_rhs_d[seq_lane_idx];
-            end
-            state_q <= MM_MUL;
-          end
-          MM_MUL: begin
-            state_q <= MM_MUL_WAIT;
-          end
-          MM_MUL_WAIT: begin
-            if (mul_rsp_valid_i) begin
-              for (seq_lane_idx = 0; seq_lane_idx < DATA_ELEMS;
-                   seq_lane_idx = seq_lane_idx + 1) begin
-                mul_product_q[seq_lane_idx] <= mul_product_i[seq_lane_idx];
-              end
-              state_q <= MM_REDUCE;
-            end
-          end
-          MM_REDUCE: begin
-            lane_sum_q <= lane_sum_d;
-            if (lane_last_q) begin
-              state_q <= MM_TASK_COMMIT;
-            end else begin
-              data_sum_q <= data_sum_q + lane_sum_d;
+          MM_RUN: begin
+            rsp_lane_enable_pipe_q[1] <= rsp_lane_enable_pipe_q[0];
+            rsp_lane_last_pipe_q[1] <= rsp_lane_last_pipe_q[0];
+            if (issue_chunk) begin
+              rsp_lane_enable_pipe_q[0] <= lane_enable_d;
+              rsp_lane_last_pipe_q[0] <= lane_last_d;
               compute_base_idx_q <= compute_base_idx_q + DATA_BYTES_Q;
-              state_q <= MM_LOAD;
+            end else begin
+              rsp_lane_enable_pipe_q[0] <= '0;
+              rsp_lane_last_pipe_q[0] <= 1'b0;
+            end
+
+            if (mul_rsp_valid_i) begin
+              if (rsp_lane_last_pipe_q[1]) begin
+                lane_sum_q <= lane_sum_d;
+                state_q <= MM_TASK_COMMIT;
+              end else begin
+                data_sum_q <= data_sum_q + lane_sum_d;
+              end
             end
           end
           MM_TASK_COMMIT: begin
@@ -517,6 +497,10 @@ module mfu_alu_matmul #(
             data_sum_q <= '0;
             compute_base_idx_q <= 6'd0;
             lane_sum_q <= '0;
+            rsp_lane_enable_pipe_q[0] <= '0;
+            rsp_lane_enable_pipe_q[1] <= '0;
+            rsp_lane_last_pipe_q[0] <= 1'b0;
+            rsp_lane_last_pipe_q[1] <= 1'b0;
             if (has_next_task) begin
               task_idx_q <= task_idx_q + 5'd1;
               task_weight_base_q <=
@@ -524,7 +508,7 @@ module mfu_alu_matmul #(
               task_base_q <=
                   {{(ACC_W-8){accum_q[active_slot_q][task_idx_next[4:0]][7]}},
                    accum_q[active_slot_q][task_idx_next[4:0]]};
-              state_q <= (input_payload_len_q == 6'd0) ? MM_TASK_COMMIT : MM_LOAD;
+              state_q <= (input_payload_len_q == 6'd0) ? MM_TASK_COMMIT : MM_RUN;
             end else begin
               state_q <= MM_DONE;
             end
