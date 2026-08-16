@@ -1,1 +1,6 @@
 **/.DS_Store
+build/
+build_cnoc_quant/
+trace*.log
+*.vcd
+src/rtl/verilated_router/
