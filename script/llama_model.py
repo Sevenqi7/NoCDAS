@@ -189,6 +189,7 @@ def main():
     )
     print(f"[INFO] Estimated parameters: {estimated_params:,} (~{estimated_params / 1e9:.3f} B)")
 
+    config.head_dim = config.hidden_size // config.num_attention_heads
     model = LlamaForCausalLM(config)
     model.eval()
 
